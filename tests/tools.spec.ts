@@ -2,11 +2,14 @@
 import { afterEach, beforeEach, expect, it, vi } from 'vitest'
 import { TICKET_STATES } from '../src/app/cards.ts'
 import { builtInBase, builtInParts, defaultPrompts } from '../src/app/prompts.ts'
-import { UserError } from '../src/core/index.ts'
+import { RESOURCES, type ResourceHost } from '../src/app/resources.ts'
+import { executorTools, type ExecutorToolsHost } from '../src/app/tools/executor.ts'
+import { threadKey, UserError, type Ticket, type ThreadRef } from '../src/core/index.ts'
 import { KV } from '../src/kv.ts'
-import { RESOURCES } from '../src/app/resources.ts'
 import { CliError, Commands } from '../src/infra/commands.ts'
 import { IM_WORDS, NOTE_WORDS } from '../src/infra/text.ts'
+import type { SourceContext } from '../src/sources/host.ts'
+import { testCodeup, testDeployment } from './fixtures/deployment.ts'
 import { CHAT, feishu, startRuntime, type Host } from './fixtures/host.ts'
 
 let h: Host
@@ -415,6 +418,80 @@ it('relays a worker\'s report with its ticket card and the start of its summary,
   expect(report.ticket).not.toHaveProperty('preview')
   // The end of the ticket, which the ready report brought, comes with its card.
   expect(notices().at(-1)).toMatchObject({ ticket_ended: { ticket_id: ticket.id, state: 'completed' } })
+})
+
+it('binds each change a report names to the ticket through the hosting platform, and keeps the report\'s result', async () => {
+  const { ticket, sessionId } = await h.acceptedTicket(feishu('1', '@bot 修一下回归'))
+  // The ticket's own branch is the one named after its worktree, which the accept named after the ticket.
+  const pull = { number: 12, state: 'open', html_url: 'https://github.com/acme/widgets/pull/12', title: 'Fix the regression',
+    user: { login: 'agent-bot' }, head: { ref: `bugfix/261102-${ticket.execution!.name}`, sha: 'abc' }, base: { ref: 'release/20261101' } }
+  vi.mocked(Commands.prototype.gh).mockImplementation(async args => {
+    if (args[1]?.includes('/pulls/99')) return { ...pull, number: 99, user: { login: 'carol' } }
+    return args[1]?.includes('/pulls/') ? pull : { default_branch: 'master', permissions: { push: true } }
+  })
+  const report = (changes: unknown[]) => h.runTool(sessionId, 'orchestrator_report',
+    { state: 'progress', summary: 'Opened the pull request.', changes, result: { status: 'fixed', root_cause: 'stale cache' } })
+  // A change by another account is refused rather than recorded, so the report leaves nothing behind.
+  await expect(report([{ repository: 'acme/widgets', localId: 99 }])).rejects.toThrow('does not belong')
+  expect(h.runtime.store.tickets.get(ticket.id)!.follows ?? []).toEqual([])
+  expect(await report([{ repository: 'acme/widgets', localId: 12 }])).toEqual({ reported: true, notification: 'internal_only' })
+  const stored = h.runtime.store.tickets.get(ticket.id)!
+  expect(stored.follows).toEqual([{ thread: 'github:12', own: true }])
+  expect(h.runtime.store.threads.get('github:12')?.meta).toMatchObject({ number: 12, isPr: true, url: pull.html_url, prAuthor: 'agent-bot' })
+  expect(stored.assignments.at(-1)!.report).toMatchObject({ state: 'progress', result: { status: 'fixed', root_cause: 'stale cache' } })
+  // A GitHub deployment's worker reads no target-release tool at all: pull requests target a branch a person names.
+  await expect(h.runTool(sessionId, 'orchestrator_codeup_target', {})).rejects.toThrow('is not registered')
+})
+
+it('follows a reported merge request for context where a change does not end its ticket, and computes the target release', async () => {
+  const codeup = testCodeup()
+  const deployment = testDeployment({ github: undefined, codeup, repository: '' })
+  const merge = { localId: 7, title: 'Fix the regression', sourceBranch: 'bugfix/261102-fix-7', targetBranch: 'release/20261101',
+    state: 'OPEN', webUrl: 'https://codeup.aliyun.com/org-1/group/app/change/7', author: { id: 'user-1' } }
+  const calls: string[][] = []
+  const commands = { withSignal: () => commands, aliyun: async (first: unknown, second?: readonly string[]) => {
+    const argv = second ?? first as readonly string[]
+    calls.push([...argv])
+    // The typed overload hands back the record the CLI printed, which the caller validates; the plain one hands back its text.
+    if (second) return merge
+    if (argv[1] === 'codeup-list-branches') return JSON.stringify({ result: [{ name: 'master' }, { name: 'release/20261101' }] })
+    if (argv[1] === 'codeup-get-compare') return '{"aheadBy":2}'
+    throw new Error(`unexpected yunxiao call: ${argv.join(' ')}`)
+  } } as unknown as Commands
+  const ticket = { id: 'ticket-1', execution: { name: 'fix-7', directory: '/work/fix-7', assignment: '' },
+    origin: { triggerId: 'trigger-1', triggerIds: ['trigger-1'] }, follows: [] } as unknown as Ticket
+  const seen = { followed: [] as string[], bound: [] as { key: string; own: boolean; ends: boolean }[], patched: [] as Record<string, unknown>[],
+    reports: [] as Record<string, unknown>[] }
+  const context = { deployment, commands, ready: Promise.resolve(), configured: () => true, config: () => undefined,
+    receive: () => ({ queued: true }), atomic: <T>(work: () => T): T => work(), state: { get: () => undefined, set: () => {}, keys: () => [] },
+    threads: { get: () => undefined, subscribed: () => [], describe: () => {},
+      patch: (key: string, meta: Record<string, unknown>) => { seen.patched.push({ key, ...meta }) } },
+    tickets: { get: () => ticket, open: () => [ticket], threadClosed: () => {},
+      bindThread: (_id: string, thread: ThreadRef, own: boolean, ends?: boolean) => {
+        seen.bound.push({ key: threadKey(thread), own, ends: ends !== false })
+      } },
+    triggers: { get: () => undefined, latest: () => undefined }, notify: () => {}, report: () => {} } as unknown as SourceContext
+  const host = { engine: { report: (_id: string, report: Record<string, unknown>) => { seen.reports.push(report); return ticket },
+      followForContext: (_id: string, thread: ThreadRef) => { seen.followed.push(threadKey(thread)); return true },
+      reply: () => ({}), markUnrelated: () => {}, handback: () => false },
+    store: { tickets: context.tickets, replyStatus: () => undefined, atomic: <T>(work: () => T): T => work() },
+    sessions: { relay: () => {}, notify: () => {} }, resources: {} as unknown as ResourceHost,
+    source: context, sendReplies: async () => {} } as unknown as ExecutorToolsHost
+  const tools = executorTools(host, ticket)
+  const run = (name: string, args: unknown) => tools.find(item => item.name === name)!.execute(args, new AbortController().signal)
+  expect(await run('orchestrator_report', { state: 'progress', summary: 'Opened the merge request.', changes: [{ repository: 'repo-1', localId: 7 }] }))
+    .toEqual({ reported: true, notification: 'internal_only' })
+  // A Codeup change binds its Thread for its messages only: the ticket ends with its own ready report, not the merge.
+  expect(seen.bound).toEqual([{ key: 'yunxiao:mr:repo-1:7', own: true, ends: false }])
+  expect(seen.followed).toEqual([])
+  expect(seen.patched).toEqual([{ key: 'yunxiao:mr:repo-1:7', number: 7, isPr: true, url: merge.webUrl, prAuthor: 'user-1' }])
+  expect(seen.reports.at(-1)).toMatchObject({ state: 'progress', summary: 'Opened the merge request.' })
+  // The target release is computed on demand: the previous release until it merges back, and the repository as Codeup names it.
+  expect(await run('orchestrator_codeup_target', { repository: 'group/app' })).toEqual({ repository: 'repo-1', target: 'release/20261101',
+    basis: 'previous', previous: 'release/20261101', mergedBack: false, base: 'master', ahead: 2 })
+  expect(await run('orchestrator_codeup_target', {})).toMatchObject({ repository: 'repo-1', target: 'release/20261101' })
+  await expect(run('orchestrator_codeup_target', { repository: 'group/other' })).rejects.toThrow('is not a repository of the Codeup workspace')
+  expect(calls.filter(call => call[1] === 'codeup-get-compare')).toHaveLength(2)
 })
 
 it('tells the main Session of the settings, prompts, requeues and unsubscriptions others made, never of its own', async () => {

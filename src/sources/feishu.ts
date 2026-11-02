@@ -57,10 +57,12 @@ export const feishuKind: SourceKind<FeishuConfig> = {
     if (chat) return { listened: true, observed: chat.listen === 'all', row: chat.chatId }
     return config.otherChats === 'mentions' ? { listened: true, observed: false, row: 'other' } : { listened: false, reason: 'chat_not_allowed' }
   },
-  // A reply goes only to a chat the Source still receives.
+  // A reply goes only to a chat the Source still receives; a message the host starts in a person's direct chat names the
+  // person instead, which the Source's receive settings do not decide.
   channel: {
-    allowed: (address, config) =>
-      feishuKind.scope!({ meta: { chatId: address.chatId ?? '', direct: address.direct === 'true' } }, config).listened,
+    allowed: (address, config) => address.new === 'true' && !!address.openId
+      ? true
+      : feishuKind.scope!({ meta: { chatId: address.chatId ?? '', direct: address.direct === 'true' } }, config).listened,
     send: sendFeishu, link: feishuLink,
   },
   threadContext: feishuThreadContext,

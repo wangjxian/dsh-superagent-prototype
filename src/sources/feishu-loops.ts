@@ -8,7 +8,7 @@ import { feishuChatLink } from './feishu-channel.ts'
 import type { FeishuBot } from '../deployment.ts'
 import { validItems, type Tally } from '../infra/commands.ts'
 import { readFeishu, type FeishuRef } from './feishu-read.ts'
-import { feishuRef, feishuTime, feishuTrigger, HistoricalMessageSchema, historyEvent, HistoryPageSchema, SOURCE, topicEvent }
+import { feishuRef, feishuTime, feishuTrigger, HistoricalMessageSchema, historyEvent, HistoryPageSchema, markApproval, SOURCE, topicEvent }
   from './feishu-trigger.ts'
 import { health, type SourceContext } from './host.ts'
 import { KV } from '../kv.ts'
@@ -24,12 +24,14 @@ const bot = (ctx: SourceContext): FeishuBot => {
   return resolved
 }
 async function receive(ctx: SourceContext, trigger: Trigger): Promise<void> {
-  await ctx.receive(trigger)
-  const chatId = String(trigger.meta.chatId ?? '')
+  // A reply to a merge confirmation is the host's to act on, not work for an assessment: the Policy's gate skips it.
+  const marked = markApproval(trigger, messageId => ctx.state.get(KV.merge.message(messageId)) !== undefined)
+  await ctx.receive(marked)
+  const chatId = String(marked.meta.chatId ?? '')
   if (!chatId) return
   const name = ctx.state.get(KV.sources.labels(SOURCE))?.[chatId] ?? chatId
-  const chat = trigger.meta.direct === true ? { value: { zh: '私聊', en: 'Direct message' } } : { value: name }
-  for (const ref of trigger.threads) ctx.threads.describe(threadKey(ref), { url: chatLink(ctx, chatId), facts: { chat } })
+  const chat = marked.meta.direct === true ? { value: { zh: '私聊', en: 'Direct message' } } : { value: name }
+  for (const ref of marked.threads) ctx.threads.describe(threadKey(ref), { url: chatLink(ctx, chatId), facts: { chat } })
 }
 const chatLink = (ctx: SourceContext, chatId: string): string => feishuChatLink(ctx.deployment.feishu?.brand ?? 'feishu', chatId)
 function available(ctx: SourceContext): boolean {

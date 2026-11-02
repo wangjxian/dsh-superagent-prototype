@@ -37,7 +37,9 @@ export const KV = {
   queues: { relays: record<{ id: string; text: string }[]>('relay-queue'), unsubscribed: record<string[]>('subscription-results'),
     prompts: record<number | null>('prompt-notification'), settings: record<number | null>('settings-notification') },
   /** Per-Source resolved display names mapping a named ID (such as a Feishu chat ID) to its display name. */
-  sources: { labels: family<Record<string, string>, [source: string]>('source-labels:') },
+  sources: { labels: family<Record<string, string>, [source: string]>('source-labels:'),
+    /** A digest of what a Source keeps outside the settings and still decides work by (its receiving-rule file); the Policy version carries it. */
+    digests: family<string, [source: string]>('source-digest:') },
   /**
    * GitHub Source: notification cursor and pending retries; per-Issue/PR read cursor shared by notification and polled reads;
    * per-stream cursor, start times by kind, and ETag; default-branch CI state; and per-PR CI fingerprint and revision (`revision`
@@ -48,6 +50,39 @@ export const KV = {
     stream: family<{ since: string; started: Record<string, string>; etag?: string }, [stream: string]>('github-stream:'),
     branchCi: record<{ branch?: string; failures?: string[]; revision: number }>('github-branch-ci'),
     ci: family<{ fingerprint: string; revision: number }, [number: number]>('github-ci:') },
+  /**
+   * Yunxiao Source: the work-item search cursor, the loaded receiving-rule file with the hash the Policy version carries, the
+   * last state of each work item it has seen (repair cycle, status, assignee, last comment read), and the result each ended
+   * ticket has already written back.
+   */
+  yunxiao: { cursor: record<string>('yunxiao-cursor'),
+    config: record<{ hash: string; file: unknown; at: string }>('yunxiao-config'),
+    workitem: family<{ cycle: number; status: string; assignee: string; commentAt: string }, [id: string]>('yunxiao-workitem:'),
+    writeback: family<{ at: string; status?: string }, [ticketId: string]>('yunxiao-writeback:'),
+    /**
+     * Per merge request: the head and CI fingerprint last seen, and the last comment read, so each change is reported once;
+     * `gone` marks one the account can no longer read at all (deleted, or a repository it lost access to), whose Thread closed
+     * and which no later round reads again.
+     */
+    mr: family<{ head: string; fingerprint: string; commentAt: string; revision: number; gone?: true }, [thread: string]>('yunxiao-mr:') },
+  /**
+   * Merge approvals: the state of each change request a ticket asked to merge, the confirmation message it waits on, and the
+   * message ids a person's reply may answer.
+   */
+  merge: { mr: family<{ state: string; messageId?: string; commit: string; target: string; confirmedAt?: string },
+    [thread: string]>('merge-mr:'),
+    /** One confirmation message the approver answers: a merge, a pipeline outside the ones a worker may run itself, or a PRE statement. */
+    message: family<{ thread: string; ticketId: string; at: string; kind?: 'merge' | 'pipeline' | 'sql'
+      pipeline?: { id: string; name: string }
+      sql?: readonly { title: string; file: string; database: string; phase: 'before' | 'after'; fingerprint: string }[] },
+      [messageId: string]>('merge-message:'),
+    /** The approver bound by their first direct message to the bot, when the receiving rules name none. */
+    approver: record<{ openId: string; chatId: string; at: string }>('merge-approver') },
+  /**
+   * Statements approved for PRE, by content fingerprint and target database, so one statement runs once and a changed
+   * statement needs a new approval.
+   */
+  sql: { approved: family<{ ticketId: string; at: string; database: string }, [fingerprint: string]>('sql-approved:') },
   /**
    * Feishu Source: known chats (`true` for direct messages); per-chat history cursor and active topics mapped from topic ID
    * to last-seen timestamp; and per-polled-thread seen message IDs and initialization flag.

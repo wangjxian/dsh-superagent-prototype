@@ -5,7 +5,7 @@ Use this guide to install, configure and operate dsh-superagent. It covers accou
 ## What runs
 
 - **A dedicated DeepSeek Harness profile**, called `superagent` in this guide. Create it from the Web profile template. It loads the bundle and serves its panel on `127.0.0.1`. Keep it separate from the profile you work in: the plugin changes process-wide `PATH` and git settings, and its process needs independent restarts and upgrades.
-- **An agent GitHub account.** The agent comments, pushes branches and opens pull requests as this account, through a GitHub CLI signed in only as that account.
+- **An agent account on the hosting platform.** The agent comments, pushes branches and opens change requests as this account: a GitHub user account through a `gh` CLI signed in only as that account, or a yunxiao account through an `aliyun` wrapper holding a Codeup access token. Configure at least one; with both, the agent delivers to GitHub and the Codeup account only supplies the workspace variables.
 - **Optional:** a Feishu bot for chat requests.
 
 Plugin configuration holds the state directory and machine limits. Use the panel for everything else: Sources for the repository and accounts, Policy for allowed lists, and Execution for worker directories and commands.
@@ -21,8 +21,8 @@ Both presets run with `danger-full-access` as the operator's OS user and read me
 ## Prerequisites
 
 - Node.js 22.19+ or 24+, pnpm, git 2.32+, Python 3.8+ and tmux
-- GitHub CLI (`gh`) 2.48 or later. Source CLI fields must point to `gh` or `lark-cli` wrappers; the host relies on their subcommands and output formats.
-- A repository on github.com; GitHub Enterprise Server is not supported. To create a checkout per Ticket, keep a local clone from which the prepare command can add worktrees. Install `git-lfs` if that repository uses Git LFS.
+- GitHub CLI (`gh`) 2.48 or later for GitHub, and the Aliyun CLI (`aliyun`) for Codeup. Source CLI fields must point to `gh`, `aliyun` or `lark-cli` wrappers; the host relies on their subcommands and output formats.
+- A repository the agent may push to: on github.com, or in the Codeup organization whose workspace you configure. GitHub Enterprise Server is not supported. To create a checkout per Ticket, keep a local clone from which the prepare command can add worktrees. Install `git-lfs` if that repository uses Git LFS.
 - A model provider configured for DeepSeek Harness. dsh-superagent uses the profile's default model unless the Eval or Execution settings name another.
 - For Feishu: `lark-cli` (tested with 1.0.90) and a Feishu or Lark app with a bot
 
@@ -45,6 +45,36 @@ Both presets run with `danger-full-access` as the operator's OS user and read me
    ```
 
    Sign in as the agent account; the last command prints its login. dsh-superagent reads the login the same way.
+
+### Agent yunxiao (Codeup) account
+
+1. Use a yunxiao account that may push to the repositories of the organization's workspace, and give it a personal access token with Codeup write access. dsh-superagent keeps that token in the macOS keychain and reads it only for the one `aliyun` process that needs it:
+
+   ```sh
+   security add-generic-password -s dsh-superagent-yunxiao -a <organization id> -w
+   ```
+
+   The command asks for the token and stores it under the organization's id; add `-U` to replace a token later.
+
+2. Install the Aliyun CLI and give the agent a wrapper that reads that token:
+
+   ```sh
+   cat > ~/.local/bin/aliyun-agent <<'EOF'
+   #!/bin/sh
+   token=$(/usr/bin/security find-generic-password -s dsh-superagent-yunxiao -w) || exit 1
+   ALIBABA_CLOUD_YUNXIAO_ACCESS_TOKEN="$token" exec aliyun "$@"
+   EOF
+   chmod +x ~/.local/bin/aliyun-agent
+   aliyun-agent devops base-get-user-by-token
+   ```
+
+   The last command prints the account the token belongs to, which is how setup reads it. The token never enters dsh-superagent's own environment: setup and the worker's forwarding script read the keychain entry inside the process that calls the CLI.
+
+3. Add the operator's SSH key to Codeup under **个人设置 → SSH 公钥**. Workers push over SSH: the agent's git configuration rewrites `https://codeup.aliyun.com/` to `git@codeup.aliyun.com:`, and setup checks that the key is accepted.
+
+4. Keep the clones in one workspace directory, an absolute path such as `/home/me/src/codeup`. Every repository in it whose remote is on `codeup.aliyun.com` may be delivered, and each repository a Ticket involves gets a worktree under the Ticket's directory.
+
+The Codeup card then takes the wrapper, the organization id, that workspace and, optionally, the commit email. Phase one carries the account and the workspace only: requests still arrive from GitHub or Feishu, no work item starts a Ticket on Codeup, and the Aliyun CLI subcommands and their flags are gathered in `src/infra/yunxiao.ts` for calibration against a real organization: `--source-branch` and `--content` on the merge request calls, the pagination of `codeup-list-branches` and the commit count `codeup-get-compare` reports are the likeliest differences, and changing that one file is enough.
 
 ### Feishu bot (optional)
 
@@ -92,7 +122,7 @@ Copy [examples/profile.cordis.patch.yml](../examples/profile.cordis.patch.yml) t
 
 | Key | Required | Meaning |
 | --- | --- | --- |
-| `stateDir` | yes | Absolute path: the database, the lock, the command shims in `worker-bin`, the agent's git configuration and, by default, the Ticket directories in `work`. Back it up before upgrades |
+| `stateDir` | yes | Absolute path: the database, the lock, the command shims in `worker-bin`, the git hooks in `worker-hooks`, the agent's git configuration and, by default, the Ticket directories in `work`. Back it up before upgrades |
 | `promptMaxChars`, `admissionContextMaxPages`, `admissionContextTimeoutMs` | no | The largest saved prompt configuration, and how many Thread pages one assessment reads within what time |
 
 After the first start, edit machine limits in **Settings → Deployment** or the DeepSeek Harness Plugin Manager. Changes apply without restart. `stateDir` cannot be changed there. Invalid values or unknown configuration keys prevent startup; the log identifies the key.
@@ -144,7 +174,7 @@ Check dsh-superagent: run `scripts/dsh-superagent --profile superagent status` i
 
 Setup must succeed before polling or work starts. Overview lists missing requirements and links to their settings. A settings change runs setup again. If you fix something outside the application, such as CLI authentication, choose **Check again**.
 
-1. **Sources.** Set the GitHub repository (`owner/name`) and agent CLI, for example `/home/me/.local/bin/gh-agent`. Requests normally arrive through the agent account's notifications. A new Issue or comment mentioning the account arrives on the next poll; adding a mention by editing an existing Issue body does not. Post a new comment instead. For Feishu, set the bot CLI, chats, each chat's receive-all or mentions-only mode, and whether to receive direct messages.
+1. **Sources.** Set the GitHub repository (`owner/name`) and agent CLI, for example `/home/me/.local/bin/gh-agent`. Requests normally arrive through the agent account's notifications. A new Issue or comment mentioning the account arrives on the next poll; adding a mention by editing an existing Issue body does not. Post a new comment instead. For Codeup, set the `aliyun` wrapper, the organization id and the workspace directory; with both GitHub and Codeup configured, the agent delivers to GitHub. For Feishu, set the bot CLI, chats, each chat's receive-all or mentions-only mode, and whether to receive direct messages. The yunxiao Source takes the path of its receiving-rule file, which is described below.
 2. **Policy.** The two example rules can be edited or removed. Under **On each Source**, add the GitHub accounts and Feishu users who may ask for work; until a list has someone, no request can become a Ticket. With Feishu, a chat can be chosen to sync the list from, at startup and on **Sync now**.
 3. **Execution.** The directory root and a prepare command. To give each Ticket a checkout of the repository:
 
@@ -153,8 +183,82 @@ Setup must succeed before polling or work starts. Overview lists missing require
    git -C /home/me/src/widgets worktree add -b "agent/$DSH_SUPERAGENT_NAME" "$DSH_SUPERAGENT_DIR" "refs/dsh-superagent/$DSH_SUPERAGENT_TICKET"
    ```
 
+   On Codeup the Ticket's branch comes from the Ticket's instructions, and the worktree is added from the checkout in the workspace:
+
+   ```sh
+   git -C "$DSH_SUPERAGENT_WORKSPACE/<repository>" worktree add -b "bugfix/<yymmdd>-<description>-$DSH_SUPERAGENT_NAME" "$DSH_SUPERAGENT_DIR" master
+   ```
+
    List personal CLIs, such as one signed in to your own account, as blocked commands.
-4. **Prompts.** Set the team sections: the GitHub disclosure line, review bots, the commit author and the auto-merge condition.
+4. **Prompts.** Set the team sections: the disclosure line, review bots, the commit author and the auto-merge condition, which applies to GitHub only.
+
+### Yunxiao work items
+
+The yunxiao Source turns work items assigned to the agent into Tickets. Its receiving rules live in one YAML file, `~/.config/dsh-superagent/yunxiao.yml` unless the Source's card names another path. The Source rereads the file before every poll: a file it cannot validate reports a health error and the last valid rules keep working, and a missing file leaves the Source paused until it is written. The file's digest is part of the Policy version, so changing it discards evaluations in flight.
+
+```yaml
+organization: "62cf7f0b487c500c27f70f94"   # must match the Codeup account's organization
+workspace: "/home/me/src/codeup"           # the workspace the Codeup account delivers from
+pollSeconds: 60
+
+projects:
+  - id: "451f7a12a18505b8a200ff1fd0"       # a project's id, which is also its row in the Policy
+    intake: triage                          # triage or direct; phase two does not act on it yet
+    types:
+      - category: Bug                       # 缺陷、线上故障
+        receive: ["28", "30"]               # 待确认、再次打开: statuses a Ticket may start in
+        started: "100010"                   # 处理中
+        verified: "29"                      # 已修复
+      - category: Task                      # 任务
+        receive: ["100005"]
+        started: "100010"
+        verified: "100014"
+# A requirement (Req) is never received: it is read as the work item's related context.
+release:                                    # read and validated; the host uses it from phase three
+  pattern: "release/{yyyymmdd}"
+  trunk: master
+  timezone: Asia/Shanghai
+  mergeType: ""
+pipelines:
+  allowPrefixes: ["qa-", "pre-"]
+approver:
+  feishuOpenId: ""
+```
+
+Statuses are ids, not names: they are shared across the organization and may be numbers or hexadecimal strings, so write every one of them as a string. The file holds no credential. Unknown keys and duplicate keys are refused, so a typo fails the validation instead of being ignored.
+
+A poll searches each configured project for work items whose `gmtModified` moved since the last poll, in every receive status, and opens a Ticket for one assigned to the agent. A work item that was verified or closed and comes back to a receive status starts a new repair cycle, which opens a new Ticket. Comments of a work item with a live Ticket, or with a Ticket that still follows it, arrive as follow-ups; a comment the agent wrote carries a hidden marker and is skipped. Reassigning a work item away from the agent is recorded but does not stop its Ticket yet.
+
+When a Ticket ends, the host writes one result comment on its work item — the state, the root cause, the changes and the verification evidence, never a statement's body — and moves the work item to the type's `verified` status when the work item is 已修复. A workflow that refuses that move keeps the comment and reports the refusal in the Source's health; a Ticket a person stopped writes nothing back.
+
+### Merging a change request
+
+A worker delivers a branch and its merge request; it never merges. Merging is the host's, and only after the approver confirms the target release in a Feishu direct message. The worker asks with `orchestrator_request_merge` once its work is self-reviewed, and the host:
+
+1. Reads each merge request of the Ticket and checks the conditions: it is open, has no conflict, its CI passed, and no review comment waits for an answer. It computes the target release again with the same rule the worker used.
+2. Sends one Feishu direct message listing every merge request, with the work item's serial and title, the merge request's link, the suggested release and why, the lines changed, the CI result and the commit's short SHA, and asks for an answer to that message.
+3. Parses the answer itself, never through a model: `同意`, `合` or `ok` merges into the suggested release; `改 20261102` or `改 release/20261102` moves the delivery to that release; any other text is a rejection whose words go back to the worker as a note.
+4. Before merging, checks that the answer came from the approver, answers that message, that the merge request's latest commit is the one the message named, and that the release has not merged back into the trunk since. One failed check means no merge, and the reason is answered in the same conversation.
+
+A merged merge request does not end the Ticket: it keeps following it for its messages, and the Ticket ends with its own ready report once the work is verified. When the delivery has to move — because the previous release merged back before the merge, or because the approver named another release — the host tells the worker, which creates `<branch>-to-release-<date>` from its branch, merges the target release into it, resolves the conflicts, opens a new merge request and closes the old one; the new merge request is confirmed again.
+
+The approver is `approver.feishuOpenId` in the receiving rules. When that is empty, the first direct message the approver sends the bot binds them, so a deployment can start without it. The confirmation message must be answered by replying to it: a direct message that answers nothing else is ordinary conversation.
+
+### Deploying and verifying on PRE
+
+After the host merges a change request it tells the Ticket so, and the worker deploys and verifies on PRE itself: it finds the environment's pipeline by name — a `qa-` one for QA and a `pre-` one for PRE, such as `pre-axo-manager-x64` — starts it, follows the run, and reads a failed task's log. A defect in the change is fixed and delivered again; an occasional failure is retried. `qa-` and `pre-` pipelines are the only ones a worker may start or retry: the forwarding script reads the pipeline's name first and refuses everything else, including `prod-` and `prod-pre-`, with a message that points at `orchestrator_request_pipeline`. That tool asks the approver in a Feishu direct message, and the host starts the pipeline itself when they agree.
+
+Once PRE is deployed, the worker reproduces the original problem there and verifies the fix, then reports ready with the verification it ran. The host then moves the work item to its verified status, comments the result, and the Ticket ends. A verification that fails, or a person writing on the work item, in Feishu or on the merge request, brings the Ticket back to its worker.
+
+A deployment that needs a statement run on PRE waits for the SQL approval of a later phase; a worker never runs SQL on PROD, and no pipeline of a PROD environment is started by anyone but a person.
+
+### Statements on QA, PRE and PROD
+
+A ticket that changes data carries its statements with the merge request, each with a title, the target database, whether it runs before or after the deployment, the statement, the statement that undoes it, and a read-only query answering 1 or 0 that shows whether it took effect. The result comment names the files only.
+
+QA statements the worker runs itself and records. A PRE statement waits: the worker asks with `orchestrator_sql_approval`, the host sends the approver a Feishu direct message listing every statement in full with its target database, rollback and check query, and the worker runs them only after the approver agrees. The approval is bound to the statement's content and target: a changed statement needs a new approval, and the same statement runs once per target. A statement whose outcome is unclear, such as a timeout after it was sent, is not retried; the worker checks and reports, and a person decides. A PROD statement is never run by a worker, and no configuration makes it one.
+
+The worker reads the environment's database credentials from 1Password itself; they are never in the receiving rules, the settings or a log. This confirmation is a convention held by the worker's instructions: a deployment that needs a hard boundary keeps the PRE credentials in a vault the worker cannot read.
 
 ### Management API
 
@@ -188,6 +292,7 @@ Health entries are grouped by responsibility:
 | `assessment`, `launch`, `delivery`, `relay`, `notice`, `reply` | Stored work described in [003 Execution](003-execution.md); delivery counts waiting work, while reply covers Channel messages |
 | `worker` | Executor Session event handling; appears after its first failure |
 | `github`, `feishu`, `history` | Source polling, events and history recovery |
+| `codeup` | The Codeup account: its CLI, the organization and the workspace. It receives nothing in phase one, so it reports no polling |
 | `sync:<source id>` | Allowed-list synchronization |
 
 A refusal has a status and `error`, its English text:
@@ -199,7 +304,7 @@ A refusal has a status and `error`, its English text:
 
 The blocks:
 
-- `source:github`, `source:feishu`: `{"enabled": true, "config": {…}}`. GitHub's config has `repository` and `cli`, and the switches `observeIssues`, `observePulls`, `observeComments` and `observeCi`, off by default, which receive every new Issue, new pull request and comment in the repository and the default branch's CI; Feishu's has `cli`, `chats` as `[{"chatId": "oc_…", "name": "…", "listen": "mentions"}]` (or `"all"`), `directMessages`, and `otherChats` as `"none"` or `"mentions"`.
+- `source:github`, `source:codeup`, `source:feishu`: `{"enabled": true, "config": {…}}`. GitHub's config has `repository` and `cli`, and the switches `observeIssues`, `observePulls`, `observeComments` and `observeCi`, off by default, which receive every new Issue, new pull request and comment in the repository and the default branch's CI. Codeup's has `cli`, `organization`, `workspace` and `commitEmail`; it receives nothing in phase one. Feishu's has `cli`, `chats` as `[{"chatId": "oc_…", "name": "…", "listen": "mentions"}]` (or `"all"`), `directMessages`, and `otherChats` as `"none"` or `"mentions"`.
 - `policy`: `{"rules": […], "sources": {"github": {"allowed": [{"id": "<login>"}], "bots": [{"id": "dependabot[bot]"}]}, "feishu": {"allowed": [{"id": "ou_…", "name": "…"}], "syncChat": "oc_…", "admission": {"oc_…": {"unlistedAddressed": "explicit"}}}}}`. `bots` lists the bots whose messages may become inferred candidates. An `admission` row is keyed by chat id, `other` or `direct` for Feishu, and by `issues`, `pulls`, `comments` or `ci` for GitHub; an unset cell takes its default (see [002 Authorization](002-authorization.md)).
 - `eval`: `mode`, `timeoutSeconds` and `model`.
 - `executor`: `model`, `maxWorkers`, `directory`, `prepare` and `blockedCommands`. The processing pause is a setting of its own, `paused`, which `POST executor/pause` sets.
@@ -217,18 +322,22 @@ curl -s -X PUT -H 'x-orchestrator-request: 1' -H 'content-type: application/json
 
 Setup uses the DeepSeek Harness subprocess service, as worker shells do. It removes environment variables whose names contain KEY, PASSWORD, SECRET or TOKEN.
 
-Setup verifies the GitHub repository and the agent's push access, writes the worker environment, and checks that git uses only the agent credentials for github.com. A Feishu setup failure disables only the Feishu Source.
+Setup verifies the hosting accounts and the agent's push access: the GitHub repository, or the Codeup workspace's repositories, whose token it reads from the keychain. It writes the worker environment, and checks that git uses only the agent credentials for github.com, rewrites Codeup addresses to SSH, and runs the hooks dsh-superagent writes. A Feishu setup failure disables only the Feishu Source.
 
 The process environment that setup writes:
 
-- **Command shims** in `<stateDir>/worker-bin`, first on `PATH`: `gh` runs the agent's CLI; `lark-cli` runs the bot's CLI; blocked commands fail. A shim removes its own directory from `PATH` before it runs its target.
-- **git configuration** in `<stateDir>/worker-gitconfig`: replaces the operator's global and system git configuration. It selects the agent CLI as the github.com credential helper, rewrites GitHub SSH addresses to HTTPS and defines Git LFS filters. Personal git settings such as an HTTP proxy do not apply. No commit identity is set here, git never prompts for credentials, and `GH_TOKEN` and `GITHUB_TOKEN` are removed.
+- **Command shims** in `<stateDir>/worker-bin`, first on `PATH`: `gh` runs the agent's CLI where a GitHub account is configured; `aliyun` is a forwarding script where a Codeup account is configured; `lark-cli` runs the bot's CLI; `security` always fails, so no worker reads the keychain; blocked commands fail. A shim removes its own directory from `PATH` before it runs its target.
+- **git configuration** in `<stateDir>/worker-gitconfig`: replaces the operator's global and system git configuration. It selects the agent CLI as the github.com credential helper, rewrites GitHub SSH addresses to HTTPS and Codeup HTTPS addresses to `git@codeup.aliyun.com:`, points `core.hooksPath` at `<stateDir>/worker-hooks`, and defines Git LFS filters. Personal git settings such as an HTTP proxy do not apply. No commit identity is set here, git never prompts for credentials, and `GH_TOKEN` and `GITHUB_TOKEN` are removed.
+- **Hooks** in `<stateDir>/worker-hooks`: the `pre-push` hook admits only `refs/heads/bugfix/*` and `refs/heads/feat/*` and refuses a branch deletion, so a worker cannot push a release branch; the other hooks run the repository's own hook of the same name, which `core.hooksPath` would otherwise hide.
+- **The `aliyun` forwarding script** runs the real CLI only for what a worker needs: the read-only `base-get-user-by-token`, `codeup-get-*`, `codeup-list-*`, `projex-get-*`, `projex-list-*`, `projex-search-*`, `flow-get-*` and `flow-list-*`; a merge request whose source branch is `bugfix/` or `feat/`; and a merge request comment, to which it appends the hidden marker and the line saying an agent posted it. Merging, approving, deleting, branch protection, work-item writes, pipeline runs and application or package management are refused: the host performs them, or a later phase does. Phase one runs no pipeline.
 
 A file in `worker-bin` or `worker-gitconfig` that dsh-superagent did not write stops setup. A Ticket directory inside a git repository whose own configuration adds credentials fails the Ticket.
 
 ## Try it
 
 From an allowed GitHub account, open an Issue or post a comment containing `@<agent login> <request>`. Within a polling interval (one minute by default), Overview should show a Ticket. The agent acknowledges the request, works in its own Session and directory, and delivers in the original conversation. For Feishu, mention the bot in a configured chat.
+
+With only Codeup configured, requests arrive through Feishu: the worker pushes a `bugfix/` or `feat/` branch to the workspace repository, opens a merge request whose target release the host computes, and reports it; a person merges it on Codeup. No work item starts a Ticket in phase one, and the agent neither merges nor approves.
 
 ## Upgrade
 
@@ -256,6 +365,16 @@ Setup problems appear on the overview with a link to the fix, in the panel's lan
 | `The agent GitHub CLI cannot read its account` | Sign the wrapper in with `auth login` |
 | `@… cannot read …` or `@… cannot push to …` | Give the agent account write access to the repository |
 | `The GitHub Source names no repository.` | Set the repository, `owner/name`, on the GitHub card |
+| `No code hosting account is configured: …` | Fill the GitHub card (repository and CLI) or the Codeup card (aliyun CLI, organization and workspace); one of them is required |
+| `The Codeup Source names no aliyun CLI.` or `The aliyun CLI was not found.` | Set the wrapper's absolute path, or a command name on `PATH` |
+| `The aliyun CLI cannot read its account` | The token does not belong to this organization, or it expired: add the current one to the keychain |
+| `dsh-superagent cannot read the yunxiao access token from the keychain` | Add it with `security add-generic-password -s dsh-superagent-yunxiao -a <organization id> -w` |
+| `The aliyun CLI did not report the yunxiao account.` | Run the wrapper's `devops base-get-user-by-token` by hand and check the token |
+| `The Codeup Source names no organization.` or `… no workspace.` | Set the organization id and the workspace directory on the Codeup card |
+| `… is not a directory.` on the Codeup card | Set the workspace to an absolute path that exists |
+| `git@codeup.aliyun.com does not accept the operator's SSH key` | Add the key to Codeup under 个人设置 → SSH 公钥 |
+| `No repository in … has a codeup.aliyun.com remote this account may push to` | Clone the repositories into the workspace, and give the yunxiao account push access |
+| `The aliyun CLI could not read the repository …` | Check the repository id, and that the token may read it |
 | A Ticket fails with `The prepare command failed: …` | The output names the cause, such as a wrong clone path; fix the command, then retry the Ticket |
 | `git does not read the github.com credential configuration dsh-superagent writes` | Install git 2.32 or later |
 | A Ticket fails with `The git configuration of the repository in … sets …` | Remove the named credential or `http.*.extraheader` settings from the clone's `.git/config` |

@@ -33,7 +33,6 @@ import { registerHttp, type HttpHost } from './http.ts'
 import type { LinkTarget } from './views/records.ts'
 import { candidateCard, repliedTo, sourceLink, type LinkHost } from './links.ts'
 import { eventNotice, followupNotice } from './notices.ts'
-import { pullEndNotices } from '../sources/github-pull.ts'
 import { HealthBoard } from '../infra/health.ts'
 import { Outbox } from './outbox.ts'
 import { Passes } from './passes.ts'
@@ -45,6 +44,8 @@ import { Settings } from './settings.ts'
 import { sourceContextOf, type SourceContextDeps } from './source-context.ts'
 import type { ResourceHost } from './resources.ts'
 import { mainTools, type MainToolsHost } from './tools/main.ts'
+import { Merges } from './merge.ts'
+import { currentRules } from '../sources/yunxiao.ts'
 import { executorTools, type ExecutorToolsHost } from './tools/executor.ts'
 
 // Source plugins interact with dsh-superagent exclusively through the `SourceHost` service interface.
@@ -67,6 +68,7 @@ export class Runtime extends Service implements SourceHost {
   readonly settings: Settings
   readonly executor: DshExecutor
   readonly assessor: MasterAssessor
+  readonly merges!: Merges
   readonly outbox: Outbox
   readonly engine: Engine
   readonly passes: Passes
@@ -99,19 +101,25 @@ export class Runtime extends Service implements SourceHost {
       const setup = this.setup = new Setup({ context: ctx, machine, lifetime: this.lifetime, restart })
       const deployed = () => setup.configured()
         ? environmentOf({ deployment: setup.deployment, sources: this.sources, settings: store.settings() }) : undefined
-      const feishu = () => setup.configured() && !!setup.deployment.feishu
-      const prompts = this.prompts = new Prompts(store, () => machine.promptMaxChars.get(), deployed, feishu)
+      // Skills follow the Sources that are configured: a worker reads the GitHub or the Codeup instructions only where they apply.
+      const platforms = () => setup.configured()
+        ? { github: !!setup.deployment.github, codeup: !!setup.deployment.codeup, feishu: !!setup.deployment.feishu,
+          yunxiao: !!this.sources?.instance('yunxiao')?.enabled }
+        : { github: false, codeup: false, feishu: false, yunxiao: false }
+      const prompts = this.prompts = new Prompts(store, () => machine.promptMaxChars.get(), deployed, platforms)
       const masterId = this.masterId = store.get(KV.runtime.masterId) ?? `orchestrator-${key(machine.stateDir)}`
       store.set(KV.runtime.masterId, masterId)
       const commands = this.commands = new Commands(() => setup.deployment, setup.commandEnvironment, this.lifetime)
       const board = this.board
       const effects = this.effects = new Effects(store, board)
+      // A Source's own rules (the yunxiao receiving-rule file) change the Policy version, so an evaluation in flight is discarded.
+      const digest = () => store.keys(KV.sources.digests).sort().map(name => `${name}=${store.get(name) ?? ''}`).join(';')
       const sources = this.sources = new SourceRegistry(() => store.settings(), board, kind => {
         // Sync source member lists once startup completes when a source plugin loads dynamically.
         if (kind.policy?.sync) void this.ready?.then(() => this.settings.syncable().includes(kind.kind) ? this.settings.sync(kind.kind) : undefined)
           .catch(() => { /* sync() records its failure in health. */ })
         return () => {}
-      })
+      }, digest)
       const links: LinkHost = { store, links: this.sourceLinks, commands, sources, lifetime: this.lifetime }
       const link = (trigger: Trigger, signal?: AbortSignal) => sourceLink(links, trigger, signal)
       const environment = (ticket: Ticket) => this.ticketEnvironment(ticket)
@@ -134,6 +142,21 @@ export class Runtime extends Service implements SourceHost {
       const outbox = this.outbox = new Outbox({ store, effects, sources, commands, paused: () => this.paused() })
       const { assessor, executor } = this
       const policy = () => settingsPolicy(store.settings(), sources)
+      // The approver is the person the receiving rules name, or the one whose first direct message bound them.
+      const approver = () => currentRules()?.file.approver.feishuOpenId || store.get(KV.merge.approver)?.openId || ''
+      let merges: Merges | undefined
+      /** A message the host answers itself (a merge confirmation) is no work, and the approver's first direct message binds them. */
+      const handleReceived = (triggerId: string): void => {
+        const trigger = store.triggers.get(triggerId)
+        if (!trigger) return
+        if (trigger.meta.approval === true) {
+          void merges?.onTrigger(trigger).catch((error: unknown) => { ctx.logger.warn('dsh-superagent merge approval failed: %s', String(error)) })
+          return
+        }
+        if (trigger.source === 'feishu' && trigger.meta.direct === true && trigger.human && !approver()) {
+          store.set(KV.merge.approver, { openId: trigger.actor.id, chatId: String(trigger.meta.chatId ?? ''), at: trigger.at })
+        }
+      }
       const engine = this.engine = new Engine({ repo: store, scope: sources, policy, assessor, executor,
         outbox, prepareTicket: (ticket, outcome) => executor.prepare(ticket, outcome), emit: event => {
           // Notify the main Session only about domain events it did not initiate itself.
@@ -144,13 +167,17 @@ export class Runtime extends Service implements SourceHost {
           const followed = !this.quiet && (event.type === 'trigger.received' || event.type === 'ticket.resumed' || event.type === 'trigger.followup')
           const followup = followed ? followupNotice(store, sources, event.data.triggerId) : undefined
           if (followup) sessions.relay(followup.id, followup.text)
-          // Notify the ticket's conversations whenever it ends via a pull request.
+          // Notify the ticket's conversations whenever it ends via a change of the hosting platform.
           const ended = event.type === 'ticket.ended' ? store.tickets.get(event.data.ticketId) : undefined
           if (ended && setup.configured()) {
             const request = store.triggers.get(ended.origin.triggerId)?.text ?? ''
-            for (const message of pullEndNotices(ended, request, setup.deployment.repository)) outbox.send(message)
+            for (const message of setup.deployment.hosting.endNotices(ended, request)) outbox.send(message)
           }
+          // Approval replies and the approver's first direct message are the host's, handled once this transaction commits.
+          if (event.type === 'trigger.received') queueMicrotask(() => handleReceived(event.data.triggerId))
         } })
+      this.merges = merges = new Merges({ commands, store, outbox, approver,
+        note: (ticketId, text) => { try { engine.note(ticketId, text) } catch { /* the ticket ended meanwhile */ } } })
       // Update the `evals` health entry on every pass if an evaluation failed as unavailable within the last hour.
       const evals = board.claim('evals', { state: 'ready', detail: 'No unavailable Eval in the last hour' })
       const evaluateDue = () => { engine.evaluateDue(); evals.set(evalsHealth(store)) }
@@ -159,8 +186,8 @@ export class Runtime extends Service implements SourceHost {
       this.sourceDeps = { store, engine, outbox, commands, sources, get ready() { return runtime.ready },
         get deployment() { return setup.deployment }, configured: () => setup.configured(),
         get setupProblem() { return setup.problem }, get feishuProblem() { return setup.feishuProblem }, receive: trigger => passes.receive(trigger) }
-      this.toolHost = { context: ctx, engine, store, prompts, sessions, settings: this.settings, assessor, resources,
-        get github() { return runtime.context({ kind: 'github', health: ['github'] }) },
+      this.toolHost = { context: ctx, engine, store, prompts, sessions, settings: this.settings, assessor, resources, merges,
+        get source() { return runtime.context({ kind: 'github', health: ['github'] }) },
         requestPass: () => { passes.request() }, sendReplies: () => outbox.sent(),
         quietly: run => { this.quiet++; try { return run() } finally { this.quiet-- } } }
       this.ready = this.initialize()

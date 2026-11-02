@@ -15,7 +15,9 @@ import type { Variable } from '../src/app/execution-environment.ts'
 /** The execution environment outside any ticket, as the runtime passes it once setup has finished. */
 const variables = (): Variable[] => [{ key: 'DSH_SUPERAGENT_GITHUB_REPOSITORY', value: 'acme/widgets', description: { zh: '仓库', en: 'The repository' }, owner: 'github' }]
 const ENVIRONMENT_LINE = '- DSH_SUPERAGENT_GITHUB_REPOSITORY = "acme/widgets": The repository.'
-const promptsOf = (store: Store, maxChars = 100000) => new Prompts(store, () => maxChars, variables, () => true)
+/** The platforms of a deployment that has a GitHub account, a Codeup account and a Feishu bot, so every built-in skill registers. */
+const ALL = () => ({ github: true, codeup: true, feishu: true, yunxiao: true })
+const promptsOf = (store: Store, maxChars = 100000) => new Prompts(store, () => maxChars, variables, ALL)
 function withStore(body: (store: Store, dir: string) => void): void {
   const dir = mkdtempSync(join(tmpdir(), 'prompts-')); const store = new Store(join(dir, 'db'))
   try { body(store, dir) } finally { store.close(); rmSync(dir, { recursive: true, force: true }) }
@@ -95,7 +97,7 @@ it('rejects unknown keys, built-in skill names and oversized configuration befor
     const prompts = promptsOf(store)
     expect(() => prompts.save({ ...defaultPrompts(), shared: 'x' }, 0, 'panel')).toThrow()
     expect(() => prompts.save({ communication: '', scope: '' }, 0, 'panel')).toThrow()
-    for (const name of ['github', 'feishu']) expect(() => prompts.save({ ...defaultPrompts(), skills: { [name]: 'mine' } }, 0, 'panel')).toThrow('built-in skill')
+    for (const name of ['github', 'feishu', 'codeup']) expect(() => prompts.save({ ...defaultPrompts(), skills: { [name]: 'mine' } }, 0, 'panel')).toThrow('built-in skill')
     expect(() => prompts.save({ ...defaultPrompts(), skills: { 'Bad Name': 'x' } }, 0, 'panel')).toThrow()
     expect(() => promptsOf(store, 1000).save(defaultPrompts(), 0, 'panel')).toThrow('exceeds')
     expect(prompts.current().revision).toBe(0)
@@ -108,18 +110,31 @@ it('lists a ticket\'s execution environment in its prompt, and says setup is inc
     expect(promptsOf(store).compose(defaultPrompts(), 'worker', ticket).endsWith('- DSH_SUPERAGENT_DIR = "/srv/work/fix-1": This ticket\'s directory.')).toBe(true)
     expect(promptParts(defaultPrompts(), 'worker', 'env').at(-1)).toEqual({ name: 'runtime/environment', kind: 'generated', key: 'runtime/environment',
       text: 'env' })
-    expect(new Prompts(store, () => 100000, () => undefined, () => false).compose(defaultPrompts(), 'worker')).toContain('dsh-superagent is waiting for setup')
+    expect(new Prompts(store, () => 100000, () => undefined, () => ({ github: false, codeup: false, feishu: false, yunxiao: false })).compose(defaultPrompts(), 'worker'))
+      .toContain('dsh-superagent is waiting for setup')
   })
 })
 
-it('registers the built-in Source skills, Feishu only with a Feishu bot, before the team skills', () => {
+it('registers the built-in skill of each configured platform, before the team skills', () => {
   withStore(store => {
     const config = { ...defaultPrompts(), skills: { release: 'Tag releases.' } }
     const skills = promptsOf(store).skills(config)
-    expect(skills.map(([name]) => name)).toEqual(['feishu', 'github', 'release'])
+    expect(skills.map(([name]) => name)).toEqual(['feishu', 'github', 'codeup', 'yunxiao', 'release'])
+    // The GitHub skill keeps the CLI notes of gh and lark-cli; the Codeup one carries its own usage, as gh need not be installed.
     expect(skills[1]![1]).toContain('## CLI usage')
-    expect(skills[2]![1]).toBe('Tag releases.')
-    expect(new Prompts(store, () => 100000, variables, () => false).skills(config).map(([name]) => name)).toEqual(['github', 'release'])
+    expect(skills[2]![1]).toContain('orchestrator_codeup_target')
+    expect(skills[2]![1]).not.toContain('## CLI usage')
+    // The yunxiao skill describes the work item's material and the result the host writes back.
+    expect(skills[3]![1]).toContain('yunxiao/wi/')
+    expect(skills[3]![1]).toContain('orchestrator_report')
+    expect(skills[4]![1]).toBe('Tag releases.')
+    // A platform the deployment does not have registers no skill: a worker reads only the instructions that apply.
+    const only = (platforms: { github: boolean; codeup: boolean; feishu: boolean; yunxiao: boolean }) =>
+      new Prompts(store, () => 100000, variables, () => platforms).skills(config).map(([name]) => name)
+    expect(only({ github: true, codeup: false, feishu: false, yunxiao: false })).toEqual(['github', 'release'])
+    expect(only({ github: false, codeup: true, feishu: false, yunxiao: false })).toEqual(['codeup', 'release'])
+    expect(only({ github: false, codeup: false, feishu: true, yunxiao: false })).toEqual(['feishu', 'release'])
+    expect(only({ github: false, codeup: false, feishu: false, yunxiao: true })).toEqual(['yunxiao', 'release'])
   })
 })
 
@@ -131,7 +146,8 @@ describe('overrides of built-in parts', () => {
     withStore(store => {
       const prompts = promptsOf(store)
       const edited = prompts.validate(config({ 'runtime/shared': { text: 'Shared, the team way.' }, 'runtime/dispatch': { text: '## dispatch\nRoute well.' },
-        'runtime/handoff/worker': { text: 'Hand off as a worker.' }, 'skill/github': { text: 'GitHub, the team way.' } }))
+        'runtime/handoff/worker': { text: 'Hand off as a worker.' }, 'skill/github': { text: 'GitHub, the team way.' },
+        'skill/codeup': { text: 'Codeup, the team way.' } }))
       const main = prompts.compose(edited, 'orchestrator'), worker = prompts.compose(edited, 'worker')
       for (const prompt of [main, worker]) expect(prompt.startsWith('Shared, the team way.\n\n')).toBe(true)
       expect(main).toContain('## dispatch\nRoute well.')
@@ -139,6 +155,7 @@ describe('overrides of built-in parts', () => {
       expect(worker).toContain('Hand off as a worker.')
       expect(main).toContain(handoffPolicy('orchestrator'))
       expect(prompts.skills(edited)).toContainEqual(['github', 'GitHub, the team way.'])
+      expect(prompts.skills(edited)).toContainEqual(['codeup', 'Codeup, the team way.'])
       // The parts say what they are edited by.
       expect(promptParts(edited, 'worker').find(part => part.name === 'runtime/handoff')).toMatchObject({ key: 'runtime/handoff/worker',
         text: 'Hand off as a worker.' })

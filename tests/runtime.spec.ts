@@ -28,7 +28,7 @@ import { feishuChannel } from '../src/sources/feishu-trigger.ts'
 import { commentTrigger, githubChannel } from '../src/sources/github-trigger.ts'
 import { IM_WORDS } from '../src/infra/text.ts'
 import { observePull, pullOf } from '../src/sources/github-pull.ts'
-import { credentialHelper, workerGitConfig } from '../src/infra/environment.ts'
+import { credentialHelper, workerGitConfig, workerHooks } from '../src/infra/environment.ts'
 import { policyHistory } from '../src/app/settings-history.ts'
 import { overview } from '../src/app/views/overview.ts'
 import { preview, readable } from '../src/app/views/text.ts'
@@ -150,6 +150,7 @@ beforeEach(async () => {
     [`${BOT()} config strict-mode`]: 'strict-mode: bot (source: profile)',
     [`${BOT()} api GET /open-apis/bot/v3/info --as bot --format ndjson`]: '{"bot":{"open_id":"ou_bot"},"code":0,"msg":"ok"}',
     [HELPERS]: `file:${workerGitConfig(directory)}\0${credentialHelper(AGENT())}\0`,
+    ['git config --global --get core.hooksPath']: `${workerHooks(directory)}\n`,
     [SCOPED]: `global\0credential.helper\n\0global\0credential.https://github.com.helper\n${credentialHelper(AGENT())}\0`,
   }
   const ctx = new Context()
@@ -327,7 +328,7 @@ it('records worker reports, binds the task PR, ends the ticket on ready without 
   expect(relays(runtime.masterId).at(-1)).toMatchObject({ kind: 'worker_attention', ticket: { ticket_id: ticket.id, attention: { question: 'Desktop too?' } } })
   await expect(runTool(runtime.masterId, 'orchestrator_reply', { ticket_id: ticket.id, purpose: 'attention', human_action: 'other', text: 'x' })).rejects.toThrow('current attention question')
   expect(await runTool(runtime.masterId, 'orchestrator_reply', { ticket_id: ticket.id, purpose: 'attention', human_action: 'Desktop too?', text: '要不要也改桌面端？' })).toEqual({ status: 'sent' })
-  await runTool(sessionId, 'orchestrator_report', { state: 'progress', summary: 'pr open', pr_number: 42, human_action: null })
+  await runTool(sessionId, 'orchestrator_report', { state: 'progress', summary: 'pr open', changes: [{ repository: 'acme/widgets', localId: 42 }], human_action: null })
   const bound = runtime.store.tickets.get(ticket.id)!
   expect(pullOf(bound)).toBe(42)
   expect(bound.attention).toBeUndefined()
@@ -338,7 +339,7 @@ it('records worker reports, binds the task PR, ends the ticket on ready without 
   expect(await runTool(runtime.masterId, 'orchestrator_reply', { ticket_id: ticket.id, purpose: 'result', text: '已提交 PR #42，待 review。' })).toEqual({ status: 'sent' })
   const mergedAt = new Date().toISOString()
   const merged = { number: 42, state: 'closed', merged: true, merged_at: mergedAt, html_url: 'https://github.com/acme/widgets/pull/42',
-    user: { login: 'agent-bot' }, head: { sha: 'abc', ref: 'agent/x', repo: { full_name: 'acme/widgets' } } }
+    user: { login: 'agent-bot' }, head: { sha: 'abc', ref: 'agent/x', repo: { full_name: 'acme/widgets' } }, base: { ref: 'master' } }
   await observePull(runtime.context(githubKind), merged)
   const ended = runtime.store.tickets.get(ticket.id)!
   expect(ended).toMatchObject({ ended: expect.objectContaining({ by: 'executor', outcome: 'merged' }) })
@@ -352,7 +353,7 @@ it('records worker reports, binds the task PR, ends the ticket on ready without 
 
 it('lists each ticket with the Threads it subscribes to, as their Sources describe them', async () => {
   const { sessionId, ticket } = await acceptedTicket()
-  await runTool(sessionId, 'orchestrator_report', { state: 'progress', summary: 'pr open', pr_number: 42 })
+  await runTool(sessionId, 'orchestrator_report', { state: 'progress', summary: 'pr open', changes: [{ repository: 'acme/widgets', localId: 42 }] })
   const line = () => ticketList(viewsOf(runtime), 'working', 0, 20).items.find(item => item.id === ticket.id)!
   runtime.store.threads.describe('github:42', { label: '#42 Fix the margin', facts: { number: { value: '#42' }, ci: { label: 'CI', value: { zh: '通过', en: 'passed' } } } })
   expect(line()).not.toHaveProperty('prNumber')
@@ -972,12 +973,12 @@ it('runs setup again while the Feishu bot check failed, and restores the process
 
 it('writes worker shims and the agent environment from the configuration only, and restores the environment on stop', async () => {
   const bin = join(directory, 'worker-bin')
-  expect(readdirSync(bin).sort()).toEqual(['gh', 'lark-cli'])
+  expect(readdirSync(bin).sort()).toEqual(['aliyun', 'gh', 'lark-cli', 'security'])
   expect(readFileSync(join(bin, 'lark-cli'), 'utf8')).toContain(`exec '${BOT()}'`)
   runtime.store.saveSettings({ ...runtime.store.settings(), executor: { ...runtime.store.settings().executor, blockedCommands: ['personal-gh'] } })
   const next = await restart({}, { feishu: null })
   await next.ready
-  expect(readdirSync(bin).sort()).toEqual(['gh', 'lark-cli', 'personal-gh'])
+  expect(readdirSync(bin).sort()).toEqual(['aliyun', 'gh', 'lark-cli', 'personal-gh', 'security'])
   expect(readFileSync(join(bin, 'personal-gh'), 'utf8')).toContain('personal-gh is blocked in this installation; use gh, which acts as agent-bot.')
   expect(readFileSync(join(bin, 'lark-cli'), 'utf8')).toContain('lark-cli is unavailable: this installation has no Feishu bot.')
   expect(readFileSync(join(bin, 'gh'), 'utf8')).toContain(`exec '${AGENT()}'`)
@@ -1004,9 +1005,9 @@ it('rewrites the blocked-command shims when the Executor settings change them, w
   const bin = join(directory, 'worker-bin')
   const save = (blockedCommands: string[]) => runtime.settings.save('executor', { ...runtime.store.settings().executor, blockedCommands }, runtime.store.blockRevision('executor'), 'panel')
   expect(await save(['personal-gh'])).toMatchObject({ saved: true, restarting: false })
-  expect(readdirSync(bin).sort()).toEqual(['gh', 'lark-cli', 'personal-gh'])
+  expect(readdirSync(bin).sort()).toEqual(['aliyun', 'gh', 'lark-cli', 'personal-gh', 'security'])
   await save([])
-  expect(readdirSync(bin).sort()).toEqual(['gh', 'lark-cli'])
+  expect(readdirSync(bin).sort()).toEqual(['aliyun', 'gh', 'lark-cli', 'security'])
   // The commands workers need cannot be blocked.
   await expect(save(['gh'])).rejects.toThrow()
   expect(restarts).not.toHaveBeenCalled()
@@ -1329,12 +1330,12 @@ it('records a report, the PR it binds and its relay together, or none of them', 
   deliveries.mockClear()
   const before = runtime.store.tickets.get(ticket.id)!
   // A report the Engine refuses binds no PR, though the PR itself could be bound.
-  await expect(runTool(sessionId, 'orchestrator_report', { state: 'ready', summary: 'done', pr_number: 42, human_action: 'Ship it?' })).rejects.toThrow()
+  await expect(runTool(sessionId, 'orchestrator_report', { state: 'ready', summary: 'done', changes: [{ repository: 'acme/widgets', localId: 42 }], human_action: 'Ship it?' })).rejects.toThrow()
   // A PR the pull request rules refuse records no report.
   vi.mocked(Commands.prototype.gh).mockImplementation(async args => args[1]?.includes('/pulls/')
     ? { state: 'open', user: { login: 'someone' }, html_url: 'https://github.com/acme/widgets/pull/7', head: { ref: 'feature/other', sha: 'h', repo: { full_name: 'acme/widgets' } } }
     : { default_branch: 'master', permissions: { push: true } })
-  await expect(runTool(sessionId, 'orchestrator_report', { state: 'progress', summary: 'pr open', pr_number: 7, human_action: 'Desktop too?' })).rejects.toThrow()
+  await expect(runTool(sessionId, 'orchestrator_report', { state: 'progress', summary: 'pr open', changes: [{ repository: 'acme/widgets', localId: 7 }], human_action: 'Desktop too?' })).rejects.toThrow()
   const after = runtime.store.tickets.get(ticket.id)!
   expect(after).not.toHaveProperty('follows')
   expect(after).not.toHaveProperty('attention')
@@ -1419,7 +1420,7 @@ it('releases the database and the state directory lock when it fails to start, s
 
 it('tells the conversation that the PR merged when work a restart recovered ends with it later', async () => {
   const { ticket, sessionId } = await acceptedTicket()
-  await runTool(sessionId, 'orchestrator_report', { state: 'progress', summary: 'pr open', pr_number: 42 })
+  await runTool(sessionId, 'orchestrator_report', { state: 'progress', summary: 'pr open', changes: [{ repository: 'acme/widgets', localId: 42 }] })
   // The host restarted with the worker mid-work: its Assignment starts again with a recovery note.
   const before = runtime.store.tickets.get(ticket.id)!
   runtime.engine.assignmentInterrupted(ticket.id, runningAssignment(before)!.id)
@@ -1427,7 +1428,7 @@ it('tells the conversation that the PR merged when work a restart recovered ends
   expect(runtime.store.tickets.get(ticket.id)!.assignments).toHaveLength(2)
   // The PR merged before the restart; the recovered work goes on, and nothing is said yet.
   const merged = { number: 42, state: 'closed', merged: true, merged_at: before.assignments[0]!.createdAt, html_url: 'https://github.com/acme/widgets/pull/42',
-    user: { login: 'agent-bot' }, head: { sha: 'abc', ref: 'agent/x', repo: { full_name: 'acme/widgets' } } }
+    user: { login: 'agent-bot' }, head: { sha: 'abc', ref: 'agent/x', repo: { full_name: 'acme/widgets' } }, base: { ref: 'master' } }
   await observePull(runtime.context(githubKind), merged)
   expect(runtime.store.tickets.get(ticket.id)).not.toHaveProperty('ended')
   const id = key('pr-terminal', '42', 'feishu', JSON.stringify({ chatId: CHAT, messageId: 'om_1' }), 'merged')

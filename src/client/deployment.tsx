@@ -3,6 +3,7 @@
  * Edits host-level plugin configuration limits through DSH `ConfigForm` when writable.
  */
 import { useCallback, useMemo, useSyncExternalStore } from 'react'
+import type { ReactNode } from 'react'
 import type { ConfigForm } from '@deepseek-ai/dsh-client-ui-settings/client'
 import type { ConfigPageForm } from '@deepseek-ai/dsh-client-ui-plugin-manager/client'
 import { LIMITS } from '../limits.ts'
@@ -11,7 +12,7 @@ import { InfoTip, Input } from './controls.tsx'
 import { SaveBar, useDraft } from './draft.tsx'
 import { PanelProvider, usePanel, usePanelData } from './provider.tsx'
 import { Field, Fields } from './settings-kit.tsx'
-import { setupText, type T } from './text.ts'
+import { setupText, valueLabel, type T } from './text.ts'
 import { CheckSetupButton, Hint, KeyValues, Section, SetupMessage } from './widgets.tsx'
 
 export type DeploymentForm = ConfigPageForm | undefined
@@ -55,6 +56,18 @@ export function DeploymentPage({ setup, form, accounts: showAccounts }: { setup:
   </Field>
   const feishu = accounts?.feishu ? accounts.feishu.name || accounts.feishu.botId
     : setup.feishuProblem ? setupText(t, setup.feishuProblem) : t('deploymentFeishuNone')
+  // The hosting platform decides what the other rows mean: a GitHub deployment has one repository, a Codeup one has a workspace
+  // of them, so a row the deployment does not have is left out rather than shown empty.
+  const codeup = accounts?.codeup
+  const derived: [string, ReactNode][] = [
+    [t('deploymentPlatform'), accounts ? valueLabel(t, 'source', accounts.platform) : '—'],
+    ...accounts?.repository ? [[t('deploymentRepository'), accounts.repository] as [string, ReactNode]] : [],
+    [t('deploymentAgent'), accounts ? `@${accounts.agent}` : '—'],
+    ...codeup ? [[t('deploymentCodeupOrg'), codeup.organization] as [string, ReactNode],
+      [t('deploymentCodeupWorkspace'), codeup.workspace] as [string, ReactNode],
+      [t('deploymentCodeupRepositories'), String(codeup.repositories)] as [string, ReactNode]] : [],
+    [t('deploymentFeishu'), feishu],
+  ]
   return <form className="dt-form" onSubmit={event => { void draft.submit(event) }}>
     <Fields disabled={draft.busy}>
       <Hint>{t('deploymentIntro')}</Hint>
@@ -62,8 +75,7 @@ export function DeploymentPage({ setup, form, accounts: showAccounts }: { setup:
         <p className="dt-error" role="status"><SetupMessage problem={setup.problem} lead /></p><CheckSetupButton />
       </div>}
       {showAccounts && <Section title={t('deploymentDerived')} hint={t('deploymentDerivedHint')}>
-        <KeyValues rows={[[t('deploymentRepository'), accounts?.repository ?? '—'],
-          [t('deploymentAgent'), accounts ? `@${accounts.agent}` : '—'], [t('deploymentFeishu'), feishu]]} />
+        <KeyValues rows={derived} />
         <Hint>{t('deploymentAccountsWhere')}</Hint>
       </Section>}
       <Section title={t('deploymentMachine')}>

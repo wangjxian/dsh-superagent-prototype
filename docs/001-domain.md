@@ -65,10 +65,10 @@ The concepts above and their rules are reusable. The Source implementations, the
 
 | Part | In this repository |
 | --- | --- |
-| Source | Feishu: live events, history recovery, polling of subscribed topics. GitHub: notifications, subscribed Issues and pull requests, CI changes, pull requests merged or closed, and, where switched on, every new Issue, pull request and comment in the repository and the default branch's CI |
+| Source | Feishu: live events, history recovery, polling of subscribed topics. GitHub: notifications, subscribed Issues and pull requests, CI changes, pull requests merged or closed, and, where switched on, every new Issue, pull request and comment in the repository and the default branch's CI. Yunxiao: work items assigned to the agent in the configured projects, and their comments |
 | Policy | Assessment rules, and each Source's allowed list, its sync, its bot list and its admission table |
 | Executor | A DSH Executor Session and a directory per Ticket, in an execution environment whose variables the Executor and the Sources register |
-| Channel | Feishu topic replies, GitHub comments and review thread replies |
+| Channel | Feishu topic replies, GitHub comments and review thread replies, yunxiao work-item comments |
 
 ## Glossary
 
@@ -76,7 +76,7 @@ A reference list of the terms this and the later documents use, with their Chine
 
 | Term | 中文 | Meaning |
 | --- | --- | --- |
-| Agent | 智能体 | The automated team member dsh-superagent runs, acting on Sources through identities such as a GitHub account and a Feishu bot |
+| Agent | 智能体 | The automated team member dsh-superagent runs, acting on Sources through identities such as a GitHub account, a yunxiao account and a Feishu bot |
 | Main Session | 主 Session | The DSH Session that evaluates Triggers, accepts and dispatches Tickets, and replies; `orchestrator` in code and prompts |
 | Executor Session | 执行器 Session | The DSH Session an Executor runs for one Ticket; `worker` in code and prompts |
 | Source | 来源 | A stream of events: a kind that a plugin provides, plus one instance configuration |
