@@ -38,12 +38,21 @@ async function readComments(commands: Commands, organization: string, id: string
   const raw = await commands.aliyun(RESPONSE, YUNXIAO.workitemComments(organization, id))
   return commentsOf(raw)
 }
+/** The relation types read for a work item's material: its parent, and the requirements it is associated with. */
+const RELATION_TYPES = ['PARENT', 'ASSOCIATED'] as const
 async function readRelations(commands: Commands, organization: string, id: string) {
-  const raw = await commands.aliyun(RESPONSE, YUNXIAO.workitemRelations(organization, id))
-  const records = relationsOf(raw)
-  // A relation record whose target cannot be resolved is not guessed at; it is counted and reported with the material.
-  const relations = records.flatMap(record => { const relation = relationOf(record, id); return relation ? [relation] : [] })
-  return { relations, unreadable: records.length - relations.length }
+  const relations: { workitemId: string; type: string }[] = []
+  let unreadable = 0
+  for (const type of RELATION_TYPES) {
+    const records = relationsOf(await commands.aliyun(RESPONSE, YUNXIAO.workitemRelations(organization, id, type)))
+    // A relation record whose target cannot be resolved is not guessed at; it is counted and reported with the material.
+    for (const record of records) {
+      const relation = relationOf(record, id)
+      if (relation) relations.push({ ...relation, type: relation.type || type })
+      else unreadable += 1
+    }
+  }
+  return { relations, unreadable }
 }
 /** A comment as the model reads it; the agent's own comments are marked `bot`, as they can never authorize work. */
 export function commentMessage(comment: WorkitemComment): ContextMessage {

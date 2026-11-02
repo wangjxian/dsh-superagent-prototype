@@ -1,13 +1,16 @@
 /** The yunxiao merge-request poller: its Threads, the responses it reads, the Triggers and closes it reports, and its records. */
 import { describe, expect, it, vi } from 'vitest'
 import type { ThreadRef, Ticket, Trigger } from '../src/core/index.ts'
+import type { Deployment } from '../src/deployment.ts'
 import { KV, type Family, type Key } from '../src/kv.ts'
 import { CliError, type Commands } from '../src/infra/commands.ts'
+import { releaseBranch, releaseDay, type TargetRelease } from '../src/infra/release.ts'
 import { AGENT_COMMENT } from '../src/infra/yunxiao.ts'
 import type { MergeContext, MergeRound } from '../src/sources/yunxiao-mr.ts'
-import { ciSummary, mergeChecksOf, mergeCommentsOf, mergeRequestChannel, mergeRequestOf, mergeRequestThread, mrChangeTrigger,
-  mrCiTrigger, mrCommentTrigger, newMergeRound, parseMergeThread, pollMergeRequests } from '../src/sources/yunxiao-mr.ts'
+import { ciSummary, latestPatchSet, mergeChecksOf, mergeCommentsOf, mergeRequestChannel, mergeRequestOf, mergeRequestThread, mrChangeTrigger,
+  mrCiTrigger, mrCommentTrigger, mrRetargetTrigger, newMergeRound, parseMergeThread, pollMergeRequests, readMergeRequest } from '../src/sources/yunxiao-mr.ts'
 import { YunxiaoFileSchema, type YunxiaoFile } from '../src/sources/yunxiao-config.ts'
+import { testCodeup, testDeployment, testRepository } from './fixtures/deployment.ts'
 
 /** The receiving rules a deployment writes; the merge-request poller reads the organization out of them. */
 const file: YunxiaoFile = YunxiaoFileSchema.parse({ organization: 'org-1', workspace: '/tmp/workspace',
@@ -19,10 +22,19 @@ const FIRST = '1111111111111111111111111111111111111111'
 const SECOND = '2222222222222222222222222222222222222222'
 const THREAD = 'yunxiao:mr:repo-1:12'
 
-/** A merge request as `codeup-get-change-request` reports it, in the field names a real installation prints. */
+/**
+ * A merge request as `codeup-get-change-request` reports it, in the field names a real installation prints: `webUrl` is the
+ * repository's page, and the head commit is not there but in the patch sets.
+ */
 const changeRequest = (fields: Record<string, unknown> = {}): Record<string, unknown> => ({ localId: 12, title: '修复登录失败',
-  state: 'OPEN', sourceCommitSha: FIRST, targetBranch: 'release/20261102', conflictCheckStatus: 'PASSED',
-  webUrl: 'https://codeup.aliyun.com/org-1/group/app/change/12', ...fields })
+  status: 'UNDER_REVIEW', sourceBranch: 'bugfix/261102-login-AXOAXO-6812', targetBranch: 'master', conflictCheckStatus: 'NO_CONFLICT',
+  author: { userId: 'user-1', id: 881811, name: 'yedou' }, detailUrl: 'https://codeup.aliyun.com/org-1/group/app/change/12',
+  webUrl: 'https://codeup.aliyun.com/org-1/group/app', ...fields })
+/** The patch sets of a merge request whose head is at `head`, as `codeup-list-change-request-patch-sets` reports them. */
+const patchSets = (head = FIRST): unknown => [
+  { patchSetBizId: 'ps-old', relatedMergeItemType: 'MERGE_SOURCE', commitId: 'f'.repeat(40), versionNo: 1 },
+  { patchSetBizId: `ps-${head.slice(0, 4)}`, relatedMergeItemType: 'MERGE_SOURCE', commitId: head, versionNo: 2 },
+  { patchSetBizId: 'ps-target', relatedMergeItemType: 'MERGE_TARGET', commitId: 'e'.repeat(40), versionNo: 3 }]
 /** A comment as `codeup-list-merge-request-comments` reports it. */
 const comment = (fields: Record<string, unknown> = {}): Record<string, unknown> => ({ commentBizId: 'c-1',
   content: '<p>这里要改</p>', author: { id: 'user-2' }, commentTime: '2026-11-02T01:00:00Z', ...fields })
@@ -32,8 +44,11 @@ const check = (fields: Record<string, unknown> = {}): Record<string, unknown> =>
 const checkList = (...items: unknown[]): unknown => ({ checkList: items })
 /** The CLI's answers before a test routes a subcommand. */
 const routes = (overrides: Record<string, unknown> = {}): Record<string, unknown> => ({
-  'codeup-get-change-request': changeRequest(), 'codeup-list-merge-request-comments': commentList(),
+  'codeup-get-change-request': changeRequest(), 'codeup-list-change-request-patch-sets': patchSets(), 'codeup-list-merge-request-comments': commentList(),
   'codeup-list-change-request-ci-check-list': checkList(check()), ...overrides })
+/** The Codeup account the release rule reads: the poller resolves a merge request's repository by its id or group path. */
+const DEPLOYMENT: Deployment = testDeployment({ codeup: testCodeup({ organization: 'org-1',
+  repositories: [testRepository({ id: 'repo-1', path: 'group/app' }), testRepository({ id: 'repo-2', path: 'group/app2', name: 'app2' })] }) })
 /** An open ticket following the Threads it names, each a change request's binding (`ends: false`). */
 const ticket = (id: string, threads: readonly string[]): Ticket => ({ id, title: id, decisionId: `d-${id}`,
   mandate: { strength: 'explicit', policyVersion: '', basis: { via: 'listed' }, actor: { source: 'yunxiao', id: 'user-1' }, scope: 'proj-1' },
@@ -46,6 +61,7 @@ interface HostOptions {
   routes?: Record<string, unknown>
   /** Records the poller already wrote, by key. */
   state?: Record<string, unknown>
+  deployment?: Deployment
   signal?: AbortSignal
 }
 /**
@@ -72,6 +88,7 @@ function host(options: HostOptions = {}) {
   const receive = vi.fn((_trigger: Trigger) => 'stored' as const)
   const ctx = {
     commands: commands as unknown as Commands,
+    deployment: options.deployment ?? DEPLOYMENT,
     state: {
       get: <V>(key: Key<V>): V | undefined => records.get(key) as V | undefined,
       set: <V>(key: Key<V>, value: V | undefined): void => { if (value === undefined) records.delete(key); else records.set(key, value) },
@@ -81,6 +98,7 @@ function host(options: HostOptions = {}) {
       get: (id: string) => options.tickets?.find(item => item.id === id),
       open: () => options.tickets ?? [],
       ended: () => [],
+      stop: () => {},
       bindThread: () => {},
       threadClosed: (thread: ThreadRef, outcome: 'merged' | 'closed', at: string) => { closed.push({ thread, outcome, at }) },
     },
@@ -120,8 +138,9 @@ describe('merge request threads', () => {
 
 describe('merge request responses', () => {
   it('reads the state, the commit and the conflict of a merge request, and unwraps the CLI envelope', () => {
-    expect(mergeRequestOf(changeRequest(), { repositoryId: 'repo-1', localId: 12 })).toEqual({ state: 'open', head: FIRST,
-      conflict: false, title: '修复登录失败', url: 'https://codeup.aliyun.com/org-1/group/app/change/12', target: 'release/20261102' })
+    expect(mergeRequestOf(changeRequest(), { repositoryId: 'repo-1', localId: 12 })).toEqual({ state: 'open', head: '', author: 'user-1',
+      conflict: false, title: '修复登录失败', url: 'https://codeup.aliyun.com/org-1/group/app/change/12', target: 'master',
+      source: 'bugfix/261102-login-AXOAXO-6812' })
     // A wrapped answer, the other spellings of the same fields, and a merge that names only its time.
     expect(mergeRequestOf({ result: { status: 'MERGED', sourceCommitHash: SECOND, mergedTime: '2026-11-02T02:00:00Z' } },
       { repositoryId: 'repo-1', localId: 12 })).toMatchObject({ state: 'merged', head: SECOND, endedAt: '2026-11-02T02:00:00.000Z' })
@@ -131,14 +150,27 @@ describe('merge request responses', () => {
     expect(mergeRequestOf(changeRequest({ state: 'UNDER_REVIEW', conflictCheckStatus: 'FAILED' }), { repositoryId: 'repo-1', localId: 12 }))
       .toMatchObject({ state: 'open', conflict: true })
     expect(mergeRequestOf(changeRequest({ conflictCheckStatus: undefined, hasConflict: true }), { repositoryId: 'repo-1', localId: 12 }).conflict).toBe(true)
+    expect(mergeRequestOf(changeRequest({ conflictCheckStatus: 'HAS_CONFLICT' }), { repositoryId: 'repo-1', localId: 12 }).conflict).toBe(true)
   })
-  it('raises a readable error when a merge request names no state or no commit to compare', () => {
+  it('reads the head commit and the CI patch set from the latest source patch set', async () => {
+    expect(latestPatchSet(patchSets(SECOND))).toEqual({ id: 'ps-2222', commit: SECOND })
+    expect(latestPatchSet([])).toBeUndefined()
+    const calls: string[][] = []
+    const cli = (sets: unknown) => ({ aliyun: async (_schema: unknown, argv: readonly string[]) => {
+      calls.push([...argv])
+      return argv[1] === 'codeup-get-change-request' ? changeRequest() : sets
+    } }) as unknown as Commands
+    expect(await readMergeRequest(cli(patchSets(SECOND)), 'org-1', { repositoryId: 'repo-1', localId: 12 }))
+      .toMatchObject({ state: 'open', head: SECOND, patchSet: 'ps-2222' })
+    expect(calls.map(argv => argv[1])).toEqual(['codeup-get-change-request', 'codeup-list-change-request-patch-sets'])
+    // An open merge request without a source patch set could not report a new commit.
+    await expect(readMergeRequest(cli([]), 'org-1', { repositoryId: 'repo-1', localId: 12 }))
+      .rejects.toThrow('The yunxiao merge request 12 in repo-1 names no source commit; a new commit could not be told from the last one')
+  })
+  it('raises a readable error when a merge request names no state', () => {
     // Without a state the poller cannot tell an open merge request from a closed one, so it must not guess.
     expect(() => mergeRequestOf({ title: 'x' }, { repositoryId: 'repo-1', localId: 12 }))
       .toThrow('The yunxiao merge request 12 in repo-1 names no state; the CLI response shape may have changed')
-    // An open merge request without its commit could not report a new commit; a closed one needs no commit to close.
-    expect(() => mergeRequestOf(changeRequest({ sourceCommitSha: undefined }), { repositoryId: 'repo-1', localId: 12 }))
-      .toThrow('The yunxiao merge request 12 in repo-1 names no source commit; a new commit could not be told from the last one')
     expect(mergeRequestOf({ state: 'CLOSED' }, { repositoryId: 'repo-1', localId: 12 })).toMatchObject({ state: 'closed', head: '' })
     expect(() => mergeRequestOf('not json', { repositoryId: 'repo-1', localId: 12 })).toThrow('was not recognized')
   })
@@ -155,6 +187,17 @@ describe('merge request responses', () => {
     expect(() => mergeChecksOf(checkList({ status: 'SUCCESS' }))).toThrow('has no name')
     expect(() => mergeChecksOf(checkList({ name: 'build' }))).toThrow('The yunxiao merge request CI check build has no status')
     expect(() => mergeChecksOf({ nothing: [] })).toThrow('was not recognized')
+    // Codeup's own report holds checks and commit statuses in snake_case lists, all of which count.
+    expect(mergeChecksOf({ check_list: [check()], check_runs: null, commit_statuses: [check({ name: 'lint', status: 'FAIL' })] }))
+      .toEqual([{ name: 'build', status: 'SUCCESS' }, { name: 'lint', status: 'FAIL' }])
+    expect(mergeChecksOf({ check_list: [], commit_statuses: [], display_type: 'DEFAULT_PAGE_NO_RUN_RECORD' })).toEqual([])
+  })
+  it('reads Codeup\'s snake_case comments with the replies nested under them, by the account id of their author', () => {
+    const reply = { comment_biz_id: 'c-2', content: '已改', author: { userId: 'user-1', id: 881811 }, comment_time: '2026-11-02T02:00:00+08:00' }
+    expect(mergeCommentsOf([{ comment_biz_id: 'c-1', content: '这里要改', author: { userId: 'user-2', id: 881812 },
+      comment_time: '2026-11-02T01:00:00+08:00', last_edit_time: '2026-11-02T01:30:00+08:00', child_comments_list: [reply] }]))
+      .toEqual([{ id: 'c-1', body: '这里要改', author: 'user-2', human: true, at: '2026-11-01T17:00:00.000Z', modifiedAt: '2026-11-01T17:30:00.000Z' },
+        { id: 'c-2', body: '已改', author: 'user-1', human: true, at: '2026-11-01T18:00:00.000Z', modifiedAt: '2026-11-01T18:00:00.000Z' }])
   })
 })
 
@@ -175,14 +218,14 @@ describe('merge request triggers', () => {
   })
   it('builds a change Trigger for a new commit and for a conflict, with the commit in its ID', () => {
     const ref = { repositoryId: 'repo-1', localId: 12 }
-    const open = mergeRequestOf(changeRequest(), ref)
+    const open = { ...mergeRequestOf(changeRequest(), ref), head: FIRST }
     const clean = mrChangeTrigger(ref, open, STARTED)
     expect(clean).toMatchObject({ source: 'yunxiao', human: false, actor: { source: 'yunxiao', id: '' }, at: STARTED,
       channel: { source: 'yunxiao', thread: THREAD, address: { repository: 'repo-1', localId: '12' } },
-      meta: { repository: 'repo-1', localId: 12, kind: 'mr-change', head: FIRST, conflict: false, target: 'release/20261102' } })
-    expect(clean.text).toBe(`Merge request !12 "修复登录失败" in repo-1 is at ${FIRST.slice(0, 7)}, targeting release/20261102.`)
+      meta: { repository: 'repo-1', localId: 12, kind: 'mr-change', head: FIRST, conflict: false, target: 'master' } })
+    expect(clean.text).toBe(`Merge request !12 "修复登录失败" in repo-1 is at ${FIRST.slice(0, 7)}, targeting master.`)
     const conflicted = mrChangeTrigger(ref, { ...open, conflict: true }, STARTED)
-    expect(conflicted.text).toContain('It conflicts with release/20261102')
+    expect(conflicted.text).toContain('It conflicts with master')
     // The ID names the commit and the conflict, so the same state read twice is one piece of work.
     expect(mrChangeTrigger(ref, open, STARTED).id).toBe(clean.id)
     expect(mrChangeTrigger(ref, { ...open, head: SECOND }, STARTED).id).not.toBe(clean.id)
@@ -190,7 +233,7 @@ describe('merge request triggers', () => {
   })
   it('summarizes CI results and gives each reported change its own revision', () => {
     const ref = { repositoryId: 'repo-1', localId: 12 }
-    const open = mergeRequestOf(changeRequest(), ref)
+    const open = { ...mergeRequestOf(changeRequest(), ref), head: FIRST }
     const failed = [{ name: 'build', status: 'FAIL' }, { name: 'test', status: 'SUCCESS' }]
     expect(ciSummary(failed, '!12 at 1111111')).toBe('CI failed 1/2 on !12 at 1111111: build\nRead codeup-list-change-request-ci-check-list for every check.')
     const read = '\nRead codeup-list-change-request-ci-check-list for every check.'
@@ -212,10 +255,13 @@ describe('merge request polling', () => {
     expect(h.receive).not.toHaveBeenCalled()
     expect(h.record()).toEqual({ head: FIRST, fingerprint: expect.stringMatching(/^[0-9a-f]{32}$/), commentAt: '', revision: 0 })
     // The CI baseline is part of the same record, so the next round compares against this run.
-    expect(issued(h.calls)).toEqual(['codeup-get-change-request', 'codeup-list-merge-request-comments', 'codeup-list-change-request-ci-check-list'])
+    expect(issued(h.calls)).toEqual(['codeup-get-change-request', 'codeup-list-change-request-patch-sets', 'codeup-list-merge-request-comments',
+      'codeup-list-change-request-ci-check-list'])
+    // The checks are read for the latest source patch set, which names the head.
+    expect(flag(h.calls[3]!, '--patch-set-biz-id')).toBe('ps-1111')
 
     const moved = host({ tickets: [ticket('t-1', [THREAD])], state: Object.fromEntries(h.records),
-      routes: routes({ 'codeup-get-change-request': changeRequest({ sourceCommitSha: SECOND }) }) })
+      routes: routes({ 'codeup-list-change-request-patch-sets': patchSets(SECOND) }) })
     await pollMergeRequests(moved.ctx, file, moved.round)
     expect(moved.triggers()).toHaveLength(1)
     expect(moved.triggers()[0]).toMatchObject({ meta: { kind: 'mr-change', head: SECOND, conflict: false } })
@@ -350,5 +396,136 @@ describe('merge request polling', () => {
     await pollMergeRequests(h.ctx, file, h.round)
     expect(h.calls).toEqual([])
     expect(h.round.failures).toEqual([])
+  })
+})
+
+describe('merge request re-targeting', () => {
+  /** The release day the rule computes right now, the branch it names, and the release before it a delivery may still target. */
+  const DAY = releaseDay()
+  const TODAY = releaseBranch(DAY)
+  const PREVIOUS = releaseBranch(releaseDay(new Date(Date.now() - 24 * 3600_000)))
+  /** The merge request report of whichever local id a command names, so one repository's merge requests are scripted apart. */
+  const byLocalId = (fields: Record<string, unknown> = {}) => (argv: string[]): unknown =>
+    changeRequest({ localId: Number(flag(argv, '--local-id')), ...fields })
+  /**
+   * The CLI's answers for a repository that delivers to the day's release: its branches are the previous release and the day's,
+   * and the previous one has merged back into the trunk, which is what makes the day's release the target.
+   */
+  const released = (overrides: Record<string, unknown> = {}): Record<string, unknown> => routes({
+    'codeup-list-branches': JSON.stringify([PREVIOUS, TODAY]),
+    'codeup-get-compare': JSON.stringify({ aheadBy: 0 }),
+    'codeup-list-change-requests': JSON.stringify({ result: [{ targetBranch: PREVIOUS }] }), ...overrides })
+  /** The release an approver names instead of the rule's, which the rule itself never computes. */
+  const APPROVED = 'release/20991231'
+  /** The record merge.ts writes when the approver moves a ticket's delivery: the release decision, on the merge request it was made about. */
+  const retargeted = (target: string): Record<string, unknown> => ({ [KV.merge.mr(THREAD)]: { state: 'retarget', commit: FIRST, target } })
+
+  it('tells the ticket to move a merge request whose release has merged back to the day\'s release', async () => {
+    const h = host({ tickets: [ticket('t-1', [THREAD])],
+      routes: released({ 'codeup-get-change-request': byLocalId({ targetBranch: PREVIOUS }) }) })
+    await pollMergeRequests(h.ctx, file, h.round)
+    const moves = h.triggers().filter(trigger => trigger.meta.mrChange === 'retarget')
+    expect(moves).toHaveLength(1)
+    expect(moves[0]).toMatchObject({ source: 'yunxiao', human: false, at: STARTED,
+      threads: [{ source: 'yunxiao', id: 'mr:repo-1:12' }],
+      channel: { source: 'yunxiao', thread: THREAD, address: { repository: 'repo-1', localId: '12' } },
+      meta: { mrChange: 'retarget', repository: 'repo-1', localId: 12, from: PREVIOUS, to: TODAY } })
+    // The text says why, and what the worker must do: the move is its work, not an approval state.
+    expect(moves[0]!.text).toContain(`${PREVIOUS} has merged back into master`)
+    expect(moves[0]!.text).toContain(`create bugfix/261102-login-AXOAXO-6812-to-release-${DAY}`)
+    expect(moves[0]!.text).toContain('open a new merge request to ' + TODAY)
+    expect(moves[0]!.text).toContain('close !12, then ask to merge again')
+  })
+  it('leaves a merge request alone while it targets the release the rule computes', async () => {
+    const h = host({ tickets: [ticket('t-1', [THREAD])],
+      routes: released({ 'codeup-get-change-request': byLocalId({ targetBranch: TODAY }) }) })
+    await pollMergeRequests(h.ctx, file, h.round)
+    expect(h.triggers().filter(trigger => trigger.meta.mrChange === 'retarget')).toEqual([])
+    expect(h.round.failures).toEqual([])
+  })
+  it('does not compute a release target for a merge request that delivers to the trunk', async () => {
+    const h = host({ tickets: [ticket('t-1', [THREAD])] })
+    await pollMergeRequests(h.ctx, file, h.round)
+    // The default report targets master, which is no release branch: the release rule is not asked at all.
+    expect(h.triggers()).toEqual([])
+    expect(issued(h.calls)).not.toContain('codeup-list-branches')
+  })
+  it('hands the same move as the same Trigger, and a move to another release as a new one', async () => {
+    const h = host({ tickets: [ticket('t-1', [THREAD])],
+      routes: released({ 'codeup-get-change-request': byLocalId({ targetBranch: PREVIOUS }) }) })
+    await pollMergeRequests(h.ctx, file, h.round)
+    await pollMergeRequests(h.ctx, file, h.round)
+    const ids = h.triggers().filter(trigger => trigger.meta.mrChange === 'retarget').map(trigger => trigger.id)
+    // The ID names the merge request and the release to move to, so the second round is the Trigger the Engine drops.
+    expect(ids).toHaveLength(2)
+    expect(ids[1]).toBe(ids[0])
+    const ref = { repositoryId: 'repo-1', localId: 12 }
+    const change = { ...mergeRequestOf(changeRequest({ targetBranch: PREVIOUS }), ref), head: FIRST }
+    const target: TargetRelease = { target: TODAY, basis: 'today', mergedBack: true, base: 'master', previous: PREVIOUS }
+    expect(mrRetargetTrigger(ref, change, { ...target, target: releaseBranch('20260101') }, DAY, STARTED).id)
+      .not.toBe(mrRetargetTrigger(ref, change, target, DAY, STARTED).id)
+  })
+  it('computes a repository\'s release target once for the merge requests that share it', async () => {
+    const threads = ['yunxiao:mr:repo-1:12', 'yunxiao:mr:repo-1:13']
+    const h = host({ tickets: [ticket('t-1', threads)],
+      routes: released({ 'codeup-get-change-request': byLocalId({ targetBranch: PREVIOUS }) }) })
+    await pollMergeRequests(h.ctx, file, h.round)
+    expect(issued(h.calls).filter(name => name === 'codeup-list-branches')).toHaveLength(1)
+    expect(h.triggers().filter(trigger => trigger.meta.mrChange === 'retarget').map(trigger => trigger.meta.localId)).toEqual([12, 13])
+  })
+  it('stops asking about a merge request the approver already moved to another release', async () => {
+    const h = host({ tickets: [ticket('t-1', [THREAD])], state: retargeted(APPROVED),
+      routes: released({ 'codeup-get-change-request': byLocalId({ targetBranch: PREVIOUS }) }) })
+    await pollMergeRequests(h.ctx, file, h.round)
+    // The approver's release wins over the rule, so the merge request waiting to be replaced is not asked again.
+    expect(h.triggers().filter(trigger => trigger.meta.mrChange === 'retarget')).toEqual([])
+    // The decision is read before the rule runs, so the release rule is not even asked.
+    expect(issued(h.calls)).not.toContain('codeup-list-branches')
+  })
+  it('leaves the replacement merge request to the release the approver named', async () => {
+    const REPLACEMENT = 'yunxiao:mr:repo-1:15'
+    const h = host({ tickets: [ticket('t-1', [THREAD, REPLACEMENT])], state: retargeted(APPROVED),
+      routes: released({ 'codeup-get-change-request': byLocalId({ targetBranch: APPROVED }) }) })
+    await pollMergeRequests(h.ctx, file, h.round)
+    // The new merge request targets the approver's release, which the rule would have moved back to the day's release.
+    expect(h.triggers().filter(trigger => trigger.meta.mrChange === 'retarget')).toEqual([])
+    expect(issued(h.calls)).not.toContain('codeup-list-branches')
+    // Both merge requests were still read.
+    expect(h.calls.filter(argv => argv[1] === 'codeup-get-change-request')).toHaveLength(2)
+  })
+  it('still moves a merge request whose ticket the approver has not decided about', async () => {
+    // One ticket's delivery was moved by the approver; another ticket's was not, in the same repository.
+    const OTHER = 'yunxiao:mr:repo-1:16'
+    const h = host({ tickets: [ticket('t-1', [THREAD]), ticket('t-2', [OTHER])], state: retargeted(APPROVED),
+      routes: released({ 'codeup-get-change-request': byLocalId({ targetBranch: PREVIOUS }) }) })
+    await pollMergeRequests(h.ctx, file, h.round)
+    expect(h.triggers().filter(trigger => trigger.meta.mrChange === 'retarget').map(trigger => trigger.meta.localId)).toEqual([16])
+  })
+  it('never creates the day\'s release while polling, even when it is missing', async () => {
+    // The branch list holds only the previous release, so the rule computes the day's release without cutting it.
+    const h = host({ tickets: [ticket('t-1', [THREAD])], routes: released({
+      'codeup-list-branches': JSON.stringify([PREVIOUS]),
+      'codeup-get-change-request': byLocalId({ targetBranch: PREVIOUS }) }) })
+    await pollMergeRequests(h.ctx, file, h.round)
+    const moves = h.triggers().filter(trigger => trigger.meta.mrChange === 'retarget')
+    expect(moves).toHaveLength(1)
+    expect(moves[0]!.meta).toMatchObject({ from: PREVIOUS, to: TODAY })
+    // A poll is a read: the branch the merge needs is created by the merge, never here.
+    expect(issued(h.calls)).not.toContain('codeup-create-branch')
+  })
+  it('records a release target that could not be computed once, and reads the other merge requests anyway', async () => {
+    const threads = ['yunxiao:mr:repo-1:12', 'yunxiao:mr:repo-1:13', 'yunxiao:mr:repo-2:14']
+    const h = host({ tickets: [ticket('t-1', threads)], routes: released({
+      'codeup-get-change-request': byLocalId({ targetBranch: PREVIOUS }),
+      'codeup-list-branches': (argv: string[]) => flag(argv, '--repository-id') === 'repo-1'
+        ? new Error('StatusCode: 500') : JSON.stringify([PREVIOUS, TODAY]),
+    }) })
+    await pollMergeRequests(h.ctx, file, h.round)
+    // Both merge requests of the repository share one failed computation, so the round reports it once.
+    expect(h.round.failures).toHaveLength(1)
+    expect(h.round.failures[0]).toContain('repo-1 release target: StatusCode: 500')
+    // The rest of those merge requests' steps still ran, and the other repository is computed and moved as usual.
+    expect(h.records.has(KV.yunxiao.mr('yunxiao:mr:repo-1:12'))).toBe(true)
+    expect(h.triggers().filter(trigger => trigger.meta.mrChange === 'retarget').map(trigger => trigger.meta.repository)).toEqual(['repo-2'])
   })
 })

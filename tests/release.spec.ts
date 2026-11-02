@@ -1,6 +1,6 @@
 /** The target release rule: the previous release until it merges back, then the day's own release, created when it is missing. */
 import { describe, expect, it } from 'vitest'
-import { aheadCount, branchNames, releaseBranch, releaseBranchDay, releaseDay, targetRelease, type YunxiaoCaller } from '../src/infra/release.ts'
+import { aheadCount, branchNames, mergedTargets, releaseBranch, releaseBranchDay, releaseDay, targetRelease, type YunxiaoCaller } from '../src/infra/release.ts'
 import { testRepository } from './fixtures/deployment.ts'
 
 const repository = testRepository({ id: 'repo-1', path: 'group/app', name: 'app' })
@@ -8,12 +8,22 @@ const repository = testRepository({ id: 'repo-1', path: 'group/app', name: 'app'
 const NOON = new Date('2026-11-02T04:00:00Z')
 const branches = (...names: string[]) => ['master', ...names]
 interface Fake { caller: YunxiaoCaller; calls: string[][]; created: () => string[][] }
-/** A yunxiao CLI that answers the three calls the rule makes, recording them; `compare` is its raw report. */
-function fakeYunxiao(replies: { branches: string[]; compare?: string }): Fake {
+/**
+ * A yunxiao CLI that answers the calls the rule makes, recording them: `compare` is its raw report, and `merged` the target
+ * branches of the merged merge requests, every branch by default.
+ */
+function fakeYunxiao(replies: { branches: string[]; compare?: string; merged?: string[] }): Fake {
   const calls: string[][] = []
   const caller: YunxiaoCaller = { aliyun: async argv => {
     calls.push([...argv])
-    if (argv[1] === 'codeup-list-branches') return JSON.stringify({ result: replies.branches.map(name => ({ name })) })
+    const flag = (name: string) => argv.includes(name) ? argv[argv.indexOf(name) + 1] : undefined
+    if (argv[1] === 'codeup-list-branches') {
+      // The listing narrows by substring and pages by 100, as Codeup's does.
+      const page = Number(flag('--page') ?? 1)
+      const names = replies.branches.filter(name => name.includes(flag('--search') ?? '')).slice((page - 1) * 100, page * 100)
+      return JSON.stringify(names.map(name => ({ name })))
+    }
+    if (argv[1] === 'codeup-list-change-requests') return JSON.stringify((replies.merged ?? replies.branches).map(targetBranch => ({ targetBranch })))
     if (argv[1] === 'codeup-get-compare') return replies.compare ?? '{"aheadBy":1}'
     if (argv[1] === 'codeup-create-branch') return '{"result":{"name":"created"}}'
     throw new Error(`unexpected yunxiao call: ${argv.join(' ')}`)
@@ -52,6 +62,10 @@ describe('the yunxiao reports', () => {
     expect(aheadCount('{"commits":[]}')).toBe(0)
     expect(() => aheadCount('{"files":[]}')).toThrow('names no commit count')
   })
+  it('reads the target branches of merged merge requests', () => {
+    expect(mergedTargets('[{"targetBranch":"release/20261101"},{"targetBranch":null}]')).toEqual(['release/20261101'])
+    expect(mergedTargets('{"result":[{"targetBranch":"master"}]}')).toEqual(['master'])
+  })
 })
 
 describe('the target release', () => {
@@ -74,11 +88,44 @@ describe('the target release', () => {
     expect(await targetRelease({ organization: 'org-1', repository, caller: yunxiao.caller, now: NOON }))
       .toEqual({ target: 'release/20261102', basis: 'today-created', previous: 'release/20261101', mergedBack: true, base: 'master', ahead: 0 })
     expect(yunxiao.created()).toEqual([['devops', 'codeup-create-branch', '--organization-id', 'org-1', '--repository-id', 'repo-1',
-      '--branch-name', 'release/20261102', '--source-branch', 'master']])
+      '--branch', 'release/20261102', '--ref', 'master']])
   })
-  it('falls back to main for the base branch, and to the day\'s release when the repository has no previous release', async () => {
+  it('narrows the branch listing by the prefix the configured pattern names', async () => {
+    const yunxiao = fakeYunxiao({ branches: ['master', 'hotfix/20261101'], compare: '{"aheadBy":1}' })
+    const release = { pattern: 'hotfix/{yyyymmdd}', trunk: '', timezone: 'Asia/Shanghai', mergeType: '' }
+    expect(await targetRelease({ organization: 'org-1', repository, caller: yunxiao.caller, now: NOON, release }))
+      .toMatchObject({ target: 'hotfix/20261101', basis: 'previous' })
+    // The search follows the pattern, so a renamed release line still finds its branches.
+    expect(yunxiao.calls.find(call => call[1] === 'codeup-list-branches')).toContain('hotfix/')
+  })
+  it('cuts releases from the trunk the rules name, over the repository\'s default branch', async () => {
     const yunxiao = fakeYunxiao({ branches: ['main', 'develop'] })
+    const release = { pattern: 'release/{yyyymmdd}', trunk: 'develop', timezone: 'Asia/Shanghai', mergeType: '' }
+    expect(await targetRelease({ organization: 'org-1', repository: testRepository({ defaultBranch: 'main' }), caller: yunxiao.caller,
+      now: NOON, release })).toEqual({ target: 'release/20261102', basis: 'today-created', mergedBack: false, base: 'develop' })
+  })
+  it('reports the day\'s release without creating it when the caller asks for a read-only answer', async () => {
+    const yunxiao = fakeYunxiao({ branches: branches('release/20261101'), compare: '{"commits":[]}' })
+    expect(await targetRelease({ organization: 'org-1', repository, caller: yunxiao.caller, now: NOON, create: false }))
+      .toEqual({ target: 'release/20261102', basis: 'today', previous: 'release/20261101', mergedBack: true, base: 'master', ahead: 0 })
+    expect(yunxiao.created()).toEqual([])
+  })
+  it('keeps the previous release while nothing has merged into it, though nothing is ahead of the base either', async () => {
+    const yunxiao = fakeYunxiao({ branches: branches('release/20261101'), compare: '{"commits":[]}', merged: ['release/20261031'] })
     expect(await targetRelease({ organization: 'org-1', repository, caller: yunxiao.caller, now: NOON }))
+      .toEqual({ target: 'release/20261101', basis: 'previous', previous: 'release/20261101', mergedBack: false, base: 'master', ahead: 0 })
+    expect(yunxiao.created()).toEqual([])
+  })
+  it('reads every page of release branches', async () => {
+    const old = Array.from({ length: 150 }, (_, index) => `release/20260101-${String(index).padStart(3, '0')}_release_1_${index}`)
+    const yunxiao = fakeYunxiao({ branches: branches(...old, 'release/20261101'), compare: '{"aheadBy":1}' })
+    expect(await targetRelease({ organization: 'org-1', repository, caller: yunxiao.caller, now: NOON }))
+      .toMatchObject({ target: 'release/20261101', basis: 'previous' })
+    expect(yunxiao.calls.filter(call => call[1] === 'codeup-list-branches').map(call => call[call.indexOf('--page') + 1])).toEqual(['1', '2'])
+  })
+  it('cuts releases from the repository\'s default branch, and targets the day\'s release when there is no previous one', async () => {
+    const yunxiao = fakeYunxiao({ branches: ['main', 'develop'] })
+    expect(await targetRelease({ organization: 'org-1', repository: testRepository({ defaultBranch: 'main' }), caller: yunxiao.caller, now: NOON }))
       .toEqual({ target: 'release/20261102', basis: 'today-created', mergedBack: false, base: 'main' })
     // Without a previous release there is nothing to compare.
     expect(yunxiao.calls.map(call => call[1])).toEqual(['codeup-list-branches', 'codeup-create-branch'])

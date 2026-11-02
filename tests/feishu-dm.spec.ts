@@ -2,6 +2,7 @@
 import { describe, expect, it, vi } from 'vitest'
 import type { Trigger } from '../src/core/index.ts'
 import { CliError, Commands } from '../src/infra/commands.ts'
+import { KV } from '../src/kv.ts'
 import { createFeishuDirect, feishuDirectLink, feishuLink, sendFeishu } from '../src/sources/feishu-channel.ts'
 import { feishuKind } from '../src/sources/feishu.ts'
 import { markApproval } from '../src/sources/feishu-trigger.ts'
@@ -27,7 +28,7 @@ describe('a message the host starts in a direct chat', () => {
     const value = commands()
     const lark = vi.spyOn(value, 'lark').mockResolvedValue({ message_id: 'om_confirm' })
     expect(await sendFeishu({ commands: value }, direct)).toBe('sent')
-    expect(lark.mock.calls[0]![0]).toEqual(['im', '+messages-create', '--receive-id', 'ou_approver', '--receive-id-type', 'open_id',
+    expect(lark.mock.calls[0]![0]).toEqual(['im', '+messages-send', '--user-id', 'ou_approver',
       '--markdown', '【合并确认】AXOAXO-6812 登录后偶发白屏', '--idempotency-key', 'merge-confirm-1'])
   })
   it('reports the created message id, which a reply to the confirmation names', async () => {
@@ -66,6 +67,31 @@ describe('a message the host starts in a direct chat', () => {
   })
 })
 
+describe('a message the host starts in a ticket\'s conversation', () => {
+  /** A Source-scoped record, as the Outbox hands it to a Channel. */
+  const records = () => {
+    const kv = new Map<string, unknown>()
+    return { kv, state: { get: <V>(key: string) => kv.get(key) as V | undefined, set: <V>(key: string, value: V) => { kv.set(key, value) } } }
+  }
+  it('records the created message, so the person\'s answer reaches that ticket', async () => {
+    const value = commands()
+    vi.spyOn(value, 'lark').mockResolvedValue({ message_id: 'om_ticket_msg' })
+    const { kv, state } = records()
+    expect(await sendFeishu({ commands: value, state }, { ...direct, ticketId: 't1' })).toBe('sent')
+    expect(kv.get(KV.merge.message('om_ticket_msg'))).toEqual({ thread: 'feishu:dm:ou_approver', ticketId: 't1',
+      at: expect.any(String), kind: 'ticket' })
+  })
+  it('records nothing for a message that belongs to no ticket, or one Feishu reported no id for', async () => {
+    const value = commands()
+    const lark = vi.spyOn(value, 'lark').mockResolvedValueOnce({ message_id: 'om_unowned' }).mockResolvedValueOnce({})
+    const { kv, state } = records()
+    await sendFeishu({ commands: value, state }, direct)
+    await sendFeishu({ commands: value, state }, { ...direct, ticketId: 't1' })
+    expect([...kv.keys()]).toEqual([])
+    expect(lark).toHaveBeenCalledTimes(2)
+  })
+})
+
 describe('the approval marker', () => {
   it('marks a message that answers a merge confirmation, by its parent or its topic root', () => {
     const confirmation = (messageId: string) => messageId === 'om_confirm'
@@ -75,5 +101,14 @@ describe('the approval marker', () => {
     // A message that answers anything else, or comes from another Source, keeps its meta as it was.
     expect(markApproval(answering('om_other'), confirmation).meta).toEqual({ chatId: 'oc_dm', messageId: 'om_reply', direct: true, parentId: 'om_other' })
     expect(markApproval({ ...answering('om_confirm'), source: 'github' }, confirmation).meta.approval).toBeUndefined()
+  })
+  it('marks a reply to a message the host started in a ticket\'s conversation, and one to a triage question', () => {
+    // The Source marks every message it has a record for: the host's own branches decide what to do with the answer.
+    const records = new Map([['om_ticket_msg', { thread: '', ticketId: 't1', at: '', kind: 'ticket' }],
+      ['om_triage', { thread: '', ticketId: '', at: '', kind: 'triage', workitemId: 'wi-123' }]])
+    const lookup = (messageId: string) => records.has(messageId)
+    expect(markApproval(answering('om_ticket_msg'), lookup).meta.approval).toBe(true)
+    expect(markApproval(answering('om_triage'), lookup).meta.approval).toBe(true)
+    expect(markApproval(answering('om_other'), lookup).meta.approval).toBeUndefined()
   })
 })

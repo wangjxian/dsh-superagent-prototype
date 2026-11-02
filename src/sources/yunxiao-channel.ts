@@ -7,8 +7,8 @@ import type { SourceContext } from './host.ts'
 import type { ChannelLink, ChannelLinks } from './kind.ts'
 import { workitemUrl } from './yunxiao-trigger.ts'
 
-/** Work-item ids are digit strings in projex; an address of another shape names no work item we may write to. */
-const WORKITEM_ID = /^\d+$/
+/** Work-item ids are alphanumeric in projex (`9642d6f9acc4e415adea201cc1`); an address of another shape names no work item we may write to. */
+const WORKITEM_ID = /^[A-Za-z0-9]+$/
 /**
  * True when the work item permanently refuses writes: 云效 answers 404 for a deleted one and 403 for one the account may no
  * longer comment on. Neither changes on a retry, while 401 (the token), 5xx and a lost connection may pass later.

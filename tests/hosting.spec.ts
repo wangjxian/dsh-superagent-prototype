@@ -63,6 +63,11 @@ describe('ticket branches and source changes', () => {
     expect(ticketBranch(ticket('fix-plan-color'), 'bugfix/261102-automation-retry-scope-fix-plan-color')).toBe(true)
     expect(ticketBranch(ticket('fix-12'), 'fix-12')).toBe(true)
     expect(ticketBranch(ticket('fix-12'), 'agent/fix-12-2')).toBe(false)
+    // The team names a branch after the work item's serial, and a retarget adds `-to-release-<yyyymmdd>` after the branch it moves.
+    expect(ticketBranch(ticket('fix-12'), 'bugfix/261102-login-AXOAXO-6812', 'AXOAXO-6812')).toBe(true)
+    expect(ticketBranch(ticket('fix-12'), 'bugfix/261102-login-AXOAXO-6812-to-release-20261103', 'AXOAXO-6812')).toBe(true)
+    expect(ticketBranch(ticket('fix-12'), 'bugfix/261102-fix-12-to-release-20261103')).toBe(true)
+    expect(ticketBranch(ticket('fix-12'), 'bugfix/261102-login-AXOAXO-6813', 'AXOAXO-6812')).toBe(false)
     expect(ticketBranch({} as ClaimTicket, 'agent/x')).toBe(false)
   })
   it('reads the change a ticket started from, and nothing from a comment trigger', () => {

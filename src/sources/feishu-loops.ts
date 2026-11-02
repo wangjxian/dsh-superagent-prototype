@@ -24,7 +24,8 @@ const bot = (ctx: SourceContext): FeishuBot => {
   return resolved
 }
 async function receive(ctx: SourceContext, trigger: Trigger): Promise<void> {
-  // A reply to a merge confirmation is the host's to act on, not work for an assessment: the Policy's gate skips it.
+  // A reply to a message the host started — a merge, pipeline or SQL confirmation, a triage question, or a message in a
+  // ticket's own conversation — is the host's to act on, not work for an assessment: the Policy's gate skips it.
   const marked = markApproval(trigger, messageId => ctx.state.get(KV.merge.message(messageId)) !== undefined)
   await ctx.receive(marked)
   const chatId = String(marked.meta.chatId ?? '')

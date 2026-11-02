@@ -44,6 +44,8 @@ export interface ClaimInput {
   change: Change
   /** The change the ticket started from, when its origin trigger is one. */
   source?: Change | undefined
+  /** The serial of the work item the ticket started from (`AXOAXO-6812`), which the team's branch names end with. */
+  serial?: string | undefined
 }
 /**
  * One platform's code hosting: the account and repositories setup resolved, repository reads, change reads, the binding rule of
@@ -77,13 +79,13 @@ export interface Hosting {
 }
 /**
  * True when a branch belongs to the ticket: its last path segment is the ticket's short name, as in `agent/<name>`, or ends
- * with it after a dash, as the team's `bugfix/<yymmdd>-<description>-<name>` naming does.
+ * with it, or with the serial of the ticket's work item, after a dash, as the team's `bugfix/<yymmdd>-<description>-<serial>`
+ * naming does. A retarget branch keeps the name of the branch it moves and adds `-to-release-<yyyymmdd>`.
  */
-export const ticketBranch = (ticket: Pick<Ticket, 'execution'>, ref: string): boolean => {
-  const name = ticket.execution?.name
-  if (!name) return false
-  const last = ref.split('/').at(-1) ?? ''
-  return last === name || last.endsWith(`-${name}`)
+export const ticketBranch = (ticket: Pick<Ticket, 'execution'>, ref: string, serial?: string): boolean => {
+  const last = (ref.split('/').at(-1) ?? '').replace(/-to-release-\d{8}$/, '')
+  const ends = (name: string | undefined): boolean => !!name && (last === name || last.endsWith(`-${name}`))
+  return ends(ticket.execution?.name) || ends(serial)
 }
 /** The change a ticket started from, when its origin trigger is a change of the platform; only its number identifies it. */
 export function triggerChange(trigger: Pick<Trigger, 'meta'> | undefined, repository: string): Change | undefined {

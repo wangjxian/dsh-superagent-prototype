@@ -40,7 +40,8 @@ export type YunxiaoProject = z.infer<typeof ProjectSchema>
 /** Where a delivery goes: the release branch a ticket's merge request targets, and how it merges back to the trunk. */
 const ReleaseSchema = z.object({
   pattern: z.string().trim().min(1).default('release/{yyyymmdd}'),
-  trunk: z.string().trim().min(1).default('master'),
+  /** The branch releases merge back into; empty takes the repository's default branch. */
+  trunk: z.string().trim().default(''),
   timezone: z.string().trim().min(1).default('Asia/Shanghai'),
   mergeType: z.string().trim().default(''),
 }).strict()

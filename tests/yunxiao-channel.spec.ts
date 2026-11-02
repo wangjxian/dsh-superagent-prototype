@@ -18,7 +18,7 @@ const MARKER = '<!-- dsh-superagent:reply-1 -->'
 /** What `projex-list-workitem-comments` answers when the work item holds the comments given. */
 const comments = (...bodies: string[]): string =>
   JSON.stringify({ comments: bodies.map((content, index) => ({ id: String(index + 1), content })) })
-const LIST = ['devops', 'projex-list-workitem-comments', '--organization-id', 'org-1', '--workitem-id', '123']
+const LIST = ['devops', 'projex-list-workitem-comments', '--organization-id', 'org-1', '--id', '123']
 
 describe('the yunxiao channel', () => {
   it('posts the reply as a work-item comment, carrying its own marker and the one every agent comment carries', async () => {
@@ -29,7 +29,7 @@ describe('the yunxiao channel', () => {
     // send can find what it already wrote.
     expect(aliyun.mock.calls[0]![1]).toEqual(LIST)
     expect(aliyun.mock.calls[1]![0]).toEqual(['devops', 'projex-create-workitem-comment', '--organization-id', 'org-1',
-      '--workitem-id', '123', '--content', `收到，我看一下。\n\n${MARKER}\n${AGENT_COMMENT}`])
+      '--id', '123', '--content', `收到，我看一下。\n\n${MARKER}\n${AGENT_COMMENT}`])
     // The poll reads the same marker, so the agent's own answer never comes back as a person's message.
     expect(isAgentComment(argv(aliyun.mock.calls[1]!).at(-1)!)).toBe(true)
   })

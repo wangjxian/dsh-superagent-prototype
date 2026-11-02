@@ -6,24 +6,39 @@
  */
 import { z } from 'zod'
 import type { CodeupRepository } from '../deployment.ts'
-import { YUNXIAO } from './yunxiao.ts'
+import { escapeRegExp } from './text.ts'
+import { BRANCH_PAGE_SIZE, YUNXIAO } from './yunxiao.ts'
 
-/** The calendar a release day is named after: the organization's, never the host's own zone. */
-const RELEASE_TIME_ZONE = 'Asia/Shanghai'
-/** The branches releases are cut from and merge back into, in the order a repository's own branches decide between them. */
-const BASE_BRANCHES: readonly string[] = ['master', 'main']
-const RELEASE_BRANCH = /^release\/(\d{8})$/
-const SHANGHAI_DAY = new Intl.DateTimeFormat('en-CA', { timeZone: RELEASE_TIME_ZONE, year: 'numeric', month: '2-digit', day: '2-digit' })
+/** Where a delivery goes, as the receiving rules state it; the defaults are the team's convention. */
+export interface ReleaseRules { pattern: string; trunk: string; timezone: string; mergeType: string }
+export const DEFAULT_RELEASE: ReleaseRules = { pattern: 'release/{yyyymmdd}', trunk: '', timezone: 'Asia/Shanghai', mergeType: '' }
+/** The branch releases are cut from when neither the rules nor the repository name one. */
+const FALLBACK_TRUNK = 'master'
+/** How many pages of release branches a target computation reads, so a listing that never ends cannot spin. */
+const MAX_BRANCH_PAGES = 20
+const PLACEHOLDER = '{yyyymmdd}'
+/** The day formatters, one per zone the rules name, so a round with many merge requests formats a day once. */
+const DAY_FORMAT = new Map<string, Intl.DateTimeFormat>()
+const dayFormat = (timezone: string): Intl.DateTimeFormat => {
+  const existing = DAY_FORMAT.get(timezone)
+  if (existing) return existing
+  const format = new Intl.DateTimeFormat('en-CA', { timeZone: timezone, year: 'numeric', month: '2-digit', day: '2-digit' })
+  DAY_FORMAT.set(timezone, format)
+  return format
+}
+/** The branch pattern as a matcher, the placeholder becoming the day's capture group. */
+const branchMatcher = (pattern: string): RegExp =>
+  new RegExp(`^${pattern.split(PLACEHOLDER).map(part => escapeRegExp(part)).join('(\\d{8})')}$`)
 
-/** The Asia/Shanghai calendar day of `now` as `yyyymmdd`, the form a release branch is named after. */
-export function releaseDay(now: Date = new Date()): string {
-  const parts = Object.fromEntries(SHANGHAI_DAY.formatToParts(now).map(part => [part.type, part.value]))
+/** The calendar day of `now` in the rules' zone as `yyyymmdd`, the form a release branch is named after. */
+export function releaseDay(now: Date = new Date(), rules: ReleaseRules = DEFAULT_RELEASE): string {
+  const parts = Object.fromEntries(dayFormat(rules.timezone).formatToParts(now).map(part => [part.type, part.value]))
   return `${parts.year}${parts.month}${parts.day}`
 }
 /** The release branch of a `yyyymmdd` day. */
-export const releaseBranch = (day: string): string => `release/${day}`
+export const releaseBranch = (day: string, rules: ReleaseRules = DEFAULT_RELEASE): string => rules.pattern.replace(PLACEHOLDER, day)
 /** The `yyyymmdd` day of a release branch name, or undefined for another branch. */
-export const releaseBranchDay = (name: string): string | undefined => RELEASE_BRANCH.exec(name)?.[1]
+export const releaseBranchDay = (name: string, rules: ReleaseRules = DEFAULT_RELEASE): string | undefined => branchMatcher(rules.pattern).exec(name)?.[1]
 
 /** The yunxiao calls the target-release rule makes; `Commands` supplies them through its `aliyun` method. */
 export interface YunxiaoCaller { aliyun(argv: readonly string[]): Promise<string> }
@@ -45,6 +60,26 @@ export function branchNames(text: string): string[] {
   const entries = Array.isArray(report) ? report : report.result ?? report.branches
   if (!entries) throw new Error('The codeup-list-branches report names no branches')
   return entries.map(entry => typeof entry === 'string' ? entry : entry.name)
+}
+const MergedReport = z.union([z.array(z.looseObject({ targetBranch: z.string().nullish() })),
+  z.looseObject({ result: z.array(z.looseObject({ targetBranch: z.string().nullish() })).nullish() })])
+/** The target branches of a `codeup-list-change-requests` report of merged merge requests. */
+export function mergedTargets(text: string): string[] {
+  const report = MergedReport.parse(payload(text))
+  return (Array.isArray(report) ? report : report.result ?? []).flatMap(item => item.targetBranch ? [item.targetBranch] : [])
+}
+/** The prefix a branch search is narrowed by: whatever the pattern puts before the day, such as `release/`. */
+export const releaseSearch = (rules: ReleaseRules = DEFAULT_RELEASE): string => rules.pattern.split(PLACEHOLDER)[0] ?? ''
+/** Every release branch of a repository, read page by page: a repository keeps more branches than one page holds. */
+async function releaseBranches(caller: YunxiaoCaller, organization: string, repositoryId: string, rules: ReleaseRules): Promise<string[]> {
+  const names: string[] = []
+  const search = releaseSearch(rules)
+  for (let page = 1; page <= MAX_BRANCH_PAGES; page++) {
+    const found = branchNames(await caller.aliyun(YUNXIAO.branches(organization, repositoryId, page, search)))
+    names.push(...found)
+    if (found.length < BRANCH_PAGE_SIZE) break
+  }
+  return names
 }
 const CompareReport = z.looseObject({
   aheadBy: z.union([z.number(), z.string()]).nullish(),
@@ -72,9 +107,13 @@ export interface TargetRelease {
   basis: 'previous' | 'today' | 'today-created' | 'requested'
   /** The previous release branch, when the repository has one. */
   previous?: string
-  /** Whether the release the rule checked has merged back into the base branch: the previous one, or the one a caller named. */
+  /**
+   * Whether the release the rule checked has merged back into the base branch: the previous one, or the one a caller named.
+   * Nothing ahead of the base is not enough, as a release nothing merged into yet holds nothing either; it must also have
+   * received a merge request.
+   */
   mergedBack: boolean
-  /** The base branch releases are cut from: `master`, or `main` when the repository has no `master`. */
+  /** The base branch releases are cut from: the repository's default branch, else `master`. */
   base: string
   /** Commits that checked release holds that the base branch does not; absent when there is nothing to check. */
   ahead?: number
@@ -87,6 +126,13 @@ export interface TargetReleaseInput {
   now?: Date
   /** A release branch a person or the work item named, which wins over the computed one and must exist. */
   requested?: string
+  /** The receiving rules' release section: branch pattern, trunk and zone. Defaults to the team's convention. */
+  release?: ReleaseRules
+  /**
+   * Whether the host may create the day's release when it is missing. A caller that only asks where a delivery should go
+   * passes false: creating a branch is a change nothing asked for, and the merge that needs it creates it.
+   */
+  create?: boolean
 }
 /**
  * Computes the release branch a merge request of `repository` targets right now. A caller asks on every merge request rather
@@ -95,12 +141,14 @@ export interface TargetReleaseInput {
  */
 export async function targetRelease(input: TargetReleaseInput): Promise<TargetRelease> {
   const { organization, repository, caller } = input
-  const day = releaseDay(input.now)
-  const names = branchNames(await caller.aliyun(YUNXIAO.branches(organization, repository.id)))
-  const base = BASE_BRANCHES.find(name => names.includes(name)) ?? BASE_BRANCHES[0]!
-  const releases = names.filter(name => releaseBranchDay(name) !== undefined).sort((a, b) => a.localeCompare(b))
+  const rules = input.release ?? DEFAULT_RELEASE
+  const day = releaseDay(input.now, rules)
+  const names = await releaseBranches(caller, organization, repository.id, rules)
+  // A trunk the rules name wins over the repository's default branch, which is what a second trunk is configured for.
+  const base = rules.trunk || repository.defaultBranch || FALLBACK_TRUNK
+  const releases = names.filter(name => releaseBranchDay(name, rules) !== undefined).sort((a, b) => a.localeCompare(b))
   // The previous release is the latest one dated before today; the day a release carries never changes after its creation.
-  const previous = releases.filter(name => releaseBranchDay(name)! < day).at(-1)
+  const previous = releases.filter(name => releaseBranchDay(name, rules)! < day).at(-1)
   // A named release wins over the computed one, but only a branch that exists can be delivered to.
   if (input.requested !== undefined && !names.includes(input.requested)) {
     throw new Error(`${input.requested} is not a branch of ${repository.path}; a named release must exist`)
@@ -108,13 +156,15 @@ export async function targetRelease(input: TargetReleaseInput): Promise<TargetRe
   // Whichever release is in play, the compare says whether it has merged back, which is what makes it published.
   const checked = input.requested ?? previous
   const ahead = checked ? aheadCount(await caller.aliyun(YUNXIAO.compare(organization, repository.id, base, checked))) : undefined
-  const mergedBack = ahead === 0
+  const mergedBack = ahead === 0 && mergedTargets(await caller.aliyun(YUNXIAO.mergedChangeRequests(organization, repository.id))).includes(checked!)
   const evidence = { ...(previous ? { previous } : {}), mergedBack, base, ...(ahead !== undefined ? { ahead } : {}) }
   if (input.requested !== undefined) return { target: input.requested, basis: 'requested', ...evidence }
   // A release that has not merged back is still unpublished, so it stays the target however late the day runs.
   if (previous && !mergedBack) return { target: previous, basis: 'previous', ...evidence }
-  const today = releaseBranch(day)
+  const today = releaseBranch(day, rules)
   if (names.includes(today)) return { target: today, basis: 'today', ...evidence }
+  // A read-only caller is told where the delivery would go; the merge that needs the branch creates it.
+  if (input.create === false) return { target: today, basis: 'today', ...evidence }
   // The host creates the branch it computed: a worker's CLI is restricted to pushes on bugfix/ and feat/ branches.
   await caller.aliyun(YUNXIAO.createBranch(organization, repository.id, today, base))
   return { target: today, basis: 'today-created', ...evidence }

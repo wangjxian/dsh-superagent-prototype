@@ -89,7 +89,7 @@ describe('yunxiao receiving rules', () => {
     // A file that names only what phase two reads still validates, with the other blocks defaulted rather than required.
     const minimal = YunxiaoFileSchema.parse({ organization: 'org-1', workspace: '/tmp/workspace',
       projects: [{ id: 'proj-1', intake: 'direct', types: [{ category: 'Bug', receive: ['28'], started: '100010', verified: '29' }] }] })
-    expect(minimal).toMatchObject({ pollSeconds: 60, release: { pattern: 'release/{yyyymmdd}', trunk: 'master', timezone: 'Asia/Shanghai', mergeType: '' },
+    expect(minimal).toMatchObject({ pollSeconds: 60, release: { pattern: 'release/{yyyymmdd}', trunk: '', timezone: 'Asia/Shanghai', mergeType: '' },
       pipelines: { allowPrefixes: ['qa-', 'pre-'] }, approver: { feishuOpenId: '' } })
   })
   it('hashes the validated file, so a reformat or a reordered key is not a policy change and a changed status is', async () => {

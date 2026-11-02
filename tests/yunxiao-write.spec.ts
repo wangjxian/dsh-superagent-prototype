@@ -123,7 +123,7 @@ describe('the write-back', () => {
     expect(comment.at(-1)).toContain('已修复')
     expect(comment.at(-1)).toContain(AGENT_COMMENT)
     // The status transition names the id the receiving rules configured, as the CLI's `--biz-body` JSON.
-    expect(aliyun.mock.calls[1]![0]).toEqual(['devops', 'projex-update-workitem', '--organization-id', 'org-1', '--workitem-id', '123',
+    expect(aliyun.mock.calls[1]![0]).toEqual(['devops', 'projex-update-workitem', '--organization-id', 'org-1', '--id', '123',
       '--biz-body', '{"status":"29"}'])
   })
   it('writes in the organization its receiving rules name', async () => {

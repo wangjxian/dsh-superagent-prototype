@@ -214,22 +214,26 @@ projects:
         started: "100010"
         verified: "100014"
 # A requirement (Req) is never received: it is read as the work item's related context.
-release:                                    # read and validated; the host uses it from phase three
-  pattern: "release/{yyyymmdd}"
-  trunk: master
+release:                                    # where a delivery goes: the branch pattern, the trunk, the zone
+  pattern: "release/{yyyymmdd}"             # the day placeholder; the text before it narrows the branch listing
+  trunk: master                             # empty takes the repository's default branch
   timezone: Asia/Shanghai
-  mergeType: ""
+  mergeType: ""                             # empty merges with the host's default
 pipelines:
-  allowPrefixes: ["qa-", "pre-"]
+  allowPrefixes: ["qa-", "pre-"]            # the pipelines a worker may start itself, compared without case
 approver:
   feishuOpenId: ""
 ```
 
 Statuses are ids, not names: they are shared across the organization and may be numbers or hexadecimal strings, so write every one of them as a string. The file holds no credential. Unknown keys and duplicate keys are refused, so a typo fails the validation instead of being ignored.
 
-A poll searches each configured project for work items whose `gmtModified` moved since the last poll, in every receive status, and opens a Ticket for one assigned to the agent. A work item that was verified or closed and comes back to a receive status starts a new repair cycle, which opens a new Ticket. Comments of a work item with a live Ticket, or with a Ticket that still follows it, arrive as follow-ups; a comment the agent wrote carries a hidden marker and is skipped. Reassigning a work item away from the agent is recorded but does not stop its Ticket yet.
+A poll searches each configured project for work items whose `gmtModified` moved since the last poll, in every receive status, and opens a Ticket for one assigned to the agent. A work item that was verified or closed and comes back to a receive status starts a new repair cycle, which opens a new Ticket. Comments of a work item with a live Ticket, or with a Ticket that still follows it, arrive as follow-ups; a comment the agent wrote carries a hidden marker and is skipped.
 
-When a Ticket ends, the host writes one result comment on its work item — the state, the root cause, the changes and the verification evidence, never a statement's body — and moves the work item to the type's `verified` status when the work item is 已修复. A workflow that refuses that move keeps the comment and reports the refusal in the Source's health; a Ticket a person stopped writes nothing back.
+A project whose `intake` is `triage` asks before it starts: the Source sends the approver one Feishu direct message with the work item's serial, title, description and link. The reply decides by its first word: `开工`, `开始`, `可以`, `做吧`, `ok` or `go` starts the work and anything after it is read as a supplement the worker receives; a refusal such as `先不`, `暂缓` or `等产品确认` leaves the work item alone; and a reply that says neither, such as a question or `looks good`, decides nothing, so the question stays open and the approver can answer again. A refusal wins over a start in one message, and a work item that comes back in a new cycle asks again. A project whose `intake` is `direct` starts at once. A deployment with no approver configured falls back to starting directly and says so in the Source's health.
+
+When the Ticket starts, the host moves the work item to the category's `started` status, once per Ticket. When the work item is assigned to somebody else while a Ticket runs, the Source stops that Ticket and leaves one comment saying so. When the Ticket ends, the host writes one result comment on its work item — the state, the root cause, the changes and the verification evidence, never a statement's body — and moves the work item to the type's `verified` status when the work item is 已修复. A workflow that refuses a move keeps the comment and reports the refusal in the Source's health; a Ticket a person stopped writes nothing back.
+
+The Ticket's own conversation is the approver's direct chat: a Ticket that came from a work item sends its acknowledgements, questions and failure notices to the approver in Feishu rather than to the work item a colleague watches, and an answer there reaches the Ticket. The result comment on the work item is written by the host when the Ticket ends, as described above.
 
 ### Merging a change request
 
@@ -240,13 +244,13 @@ A worker delivers a branch and its merge request; it never merges. Merging is th
 3. Parses the answer itself, never through a model: `同意`, `合` or `ok` merges into the suggested release; `改 20261102` or `改 release/20261102` moves the delivery to that release; any other text is a rejection whose words go back to the worker as a note.
 4. Before merging, checks that the answer came from the approver, answers that message, that the merge request's latest commit is the one the message named, and that the release has not merged back into the trunk since. One failed check means no merge, and the reason is answered in the same conversation.
 
-A merged merge request does not end the Ticket: it keeps following it for its messages, and the Ticket ends with its own ready report once the work is verified. When the delivery has to move — because the previous release merged back before the merge, or because the approver named another release — the host tells the worker, which creates `<branch>-to-release-<date>` from its branch, merges the target release into it, resolves the conflicts, opens a new merge request and closes the old one; the new merge request is confirmed again.
+A merged merge request does not end the Ticket: it keeps following it for its messages, and the Ticket ends with its own ready report once the work is verified. When the delivery has to move — because the release it targets has merged back, or because the approver named another release — the host tells the worker, which creates `<branch>-to-release-<date>` from its branch, merges the target release into it, resolves the conflicts, opens a new merge request and closes the old one; the new merge request is confirmed again. The move is noticed by the merge-request poll, not only when the approver answers: a merge request whose target is no longer the release the rules compute gets one message saying so, once per new target. The poll only reads: it never creates the day's release branch, and a release the approver named wins over the computed one, so a merge request already moving to it is left alone.
 
 The approver is `approver.feishuOpenId` in the receiving rules. When that is empty, the first direct message the approver sends the bot binds them, so a deployment can start without it. The confirmation message must be answered by replying to it: a direct message that answers nothing else is ordinary conversation.
 
 ### Deploying and verifying on PRE
 
-After the host merges a change request it tells the Ticket so, and the worker deploys and verifies on PRE itself: it finds the environment's pipeline by name — a `qa-` one for QA and a `pre-` one for PRE, such as `pre-axo-manager-x64` — starts it, follows the run, and reads a failed task's log. A defect in the change is fixed and delivered again; an occasional failure is retried. `qa-` and `pre-` pipelines are the only ones a worker may start or retry: the forwarding script reads the pipeline's name first and refuses everything else, including `prod-` and `prod-pre-`, with a message that points at `orchestrator_request_pipeline`. That tool asks the approver in a Feishu direct message, and the host starts the pipeline itself when they agree.
+After the host merges a change request it tells the Ticket so, and the worker deploys and verifies on PRE itself: it finds the environment's pipeline by name — a `qa-` one for QA and a `pre-` one for PRE, such as `pre-axo-manager-x64` — starts it, follows the run, and reads a failed task's log. A defect in the change is fixed and delivered again; an occasional failure is retried. The pipelines a worker may start or retry are the ones named by `pipelines.allowPrefixes` in the receiving rules (`qa-` and `pre-` by default), compared without regard to case: the forwarding script reads the pipeline's name first and refuses everything else, including `prod-` and `prod-pre-`, with a message that points at `orchestrator_request_pipeline`. A change to those prefixes reaches the workers on the next poll, because the Source rewrites the list the script reads — unless that file was written by hand, which the host never replaces and reports in the Source's health instead. That tool asks the approver in a Feishu direct message, and the host starts the pipeline itself when they agree.
 
 Once PRE is deployed, the worker reproduces the original problem there and verifies the fix, then reports ready with the verification it ran. The host then moves the work item to its verified status, comments the result, and the Ticket ends. A verification that fails, or a person writing on the work item, in Feishu or on the merge request, brings the Ticket back to its worker.
 

@@ -57,6 +57,11 @@ export interface SourceContext {
     /** Tickets that ended at or after `since`, newest first; a Source writes its own record back for those it started. */
     ended(since: string): Ticket[]
     /**
+     * Ends a Ticket the Source itself started, such as one whose work item was assigned to somebody else; `reason` is recorded
+     * on it. A Source stops only its own Tickets, never one that merely follows a Thread it owns.
+     */
+    stop(id: string, reason?: string): void
+    /**
      * Binds an open ticket to follow a Source Thread (`own` when opened by the ticket) so the Thread's close, not a ready report,
      * ends the ticket; `ends` false binds it for its messages only, so a merged change request leaves the ticket to its report.
      */

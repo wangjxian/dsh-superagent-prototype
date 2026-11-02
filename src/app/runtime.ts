@@ -46,6 +46,7 @@ import type { ResourceHost } from './resources.ts'
 import { mainTools, type MainToolsHost } from './tools/main.ts'
 import { Merges } from './merge.ts'
 import { currentRules } from '../sources/yunxiao.ts'
+import { workerPipelinePrefixes } from '../infra/environment.ts'
 import { executorTools, type ExecutorToolsHost } from './tools/executor.ts'
 
 // Source plugins interact with dsh-superagent exclusively through the `SourceHost` service interface.
@@ -142,18 +143,35 @@ export class Runtime extends Service implements SourceHost {
       const outbox = this.outbox = new Outbox({ store, effects, sources, commands, paused: () => this.paused() })
       const { assessor, executor } = this
       const policy = () => settingsPolicy(store.settings(), sources)
+      // The pipeline prefixes in force are the ones the workers' own file names, so a worker hears the same from the host and
+      // from its forwarding script; the receiving rules are the fallback when nothing wrote that file.
+      const pipelinePrefixes = (): string[] => {
+        const written = workerPipelinePrefixes(machine.stateDir)
+        return written.length ? written : currentRules()?.file.pipelines.allowPrefixes ?? []
+      }
       // The approver is the person the receiving rules name, or the one whose first direct message bound them.
       const approver = () => currentRules()?.file.approver.feishuOpenId || store.get(KV.merge.approver)?.openId || ''
       let merges: Merges | undefined
-      /** A message the host answers itself (a merge confirmation) is no work, and the approver's first direct message binds them. */
+      /**
+       * A message the host answers itself (a merge confirmation) is no work, and the approver's first direct message binds
+       * them. Only a person the Feishu Policy already lists may bind, so whoever happens to message the bot first cannot.
+       */
       const handleReceived = (triggerId: string): void => {
         const trigger = store.triggers.get(triggerId)
         if (!trigger) return
         if (trigger.meta.approval === true) {
+          // An answer to a message the host started in a ticket's own conversation is that ticket's: it becomes a note.
+          const repliedTo = [trigger.meta.parentId, trigger.meta.rootId].find(id => typeof id === 'string' && store.get(KV.merge.message(id)))
+          const record = typeof repliedTo === 'string' ? store.get(KV.merge.message(repliedTo)) : undefined
+          if (record?.kind === 'ticket' && record.ticketId) {
+            try { engine.note(record.ticketId, `【审批人】${trigger.text}`) } catch { /* the ticket ended meanwhile */ }
+            return
+          }
           void merges?.onTrigger(trigger).catch((error: unknown) => { ctx.logger.warn('dsh-superagent merge approval failed: %s', String(error)) })
           return
         }
-        if (trigger.source === 'feishu' && trigger.meta.direct === true && trigger.human && !approver()) {
+        if (trigger.source === 'feishu' && trigger.meta.direct === true && trigger.human && !approver()
+          && allowedSender(store.settings(), trigger.actor)) {
           store.set(KV.merge.approver, { openId: trigger.actor.id, chatId: String(trigger.meta.chatId ?? ''), at: trigger.at })
         }
       }
@@ -176,7 +194,8 @@ export class Runtime extends Service implements SourceHost {
           // Approval replies and the approver's first direct message are the host's, handled once this transaction commits.
           if (event.type === 'trigger.received') queueMicrotask(() => handleReceived(event.data.triggerId))
         } })
-      this.merges = merges = new Merges({ commands, store, outbox, approver,
+      this.merges = merges = new Merges({ commands, store, outbox, approver, pipelines: pipelinePrefixes,
+        mergeType: () => currentRules()?.file.release.mergeType ?? '',
         note: (ticketId, text) => { try { engine.note(ticketId, text) } catch { /* the ticket ended meanwhile */ } } })
       // Update the `evals` health entry on every pass if an evaluation failed as unavailable within the last hour.
       const evals = board.claim('evals', { state: 'ready', detail: 'No unavailable Eval in the last hour' })

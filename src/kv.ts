@@ -58,13 +58,24 @@ export const KV = {
   yunxiao: { cursor: record<string>('yunxiao-cursor'),
     config: record<{ hash: string; file: unknown; at: string }>('yunxiao-config'),
     workitem: family<{ cycle: number; status: string; assignee: string; commentAt: string }, [id: string]>('yunxiao-workitem:'),
-    writeback: family<{ at: string; status?: string }, [ticketId: string]>('yunxiao-writeback:'),
+    writeback: family<{ at: string; ended?: string; status?: string }, [ticketId: string]>('yunxiao-writeback:'),
     /**
      * Per merge request: the head and CI fingerprint last seen, and the last comment read, so each change is reported once;
      * `gone` marks one the account can no longer read at all (deleted, or a repository it lost access to), whose Thread closed
      * and which no later round reads again.
      */
-    mr: family<{ head: string; fingerprint: string; commentAt: string; revision: number; gone?: true }, [thread: string]>('yunxiao-mr:') },
+    mr: family<{ head: string; fingerprint: string; commentAt: string; revision: number; gone?: true }, [thread: string]>('yunxiao-mr:'),
+    /**
+     * What the approver answered about a work item of a triage project: `asked` until they reply, `go` when the work may start,
+     * `declined` when they said not to. A new repair cycle asks again.
+     */
+    triage: family<{ state: 'asked' | 'go' | 'declined'; messageId?: string; answer?: string; at: string; cycle: number },
+      [id: string]>('yunxiao-triage:'),
+    /**
+     * The status a Ticket's work item was moved to when its work started, with the repair cycle it was moved for: the move
+     * happens once per cycle, so a work item reopened into a new cycle is moved again.
+     */
+    started: family<{ at: string; status: string; cycle?: number }, [ticketId: string]>('yunxiao-started:') },
   /**
    * Merge approvals: the state of each change request a ticket asked to merge, the confirmation message it waits on, and the
    * message ids a person's reply may answer.
@@ -72,9 +83,12 @@ export const KV = {
   merge: { mr: family<{ state: string; messageId?: string; commit: string; target: string; confirmedAt?: string },
     [thread: string]>('merge-mr:'),
     /** One confirmation message the approver answers: a merge, a pipeline outside the ones a worker may run itself, or a PRE statement. */
-    message: family<{ thread: string; ticketId: string; at: string; kind?: 'merge' | 'pipeline' | 'sql'
+    /** `kind` is one of merge, pipeline, sql, triage and ticket; merge.ts narrows it for its own records. */
+    message: family<{ thread: string; ticketId: string; at: string; kind?: string
       pipeline?: { id: string; name: string }
-      sql?: readonly { title: string; file: string; database: string; phase: 'before' | 'after'; fingerprint: string }[] },
+      sql?: readonly { title: string; file: string; database: string; phase: 'before' | 'after'; fingerprint: string }[]
+      /** A triage question names the work item it asks about; a ticket's own message names the ticket an answer belongs to. */
+      workitemId?: string },
       [messageId: string]>('merge-message:'),
     /** The approver bound by their first direct message to the bot, when the receiving rules name none. */
     approver: record<{ openId: string; chatId: string; at: string }>('merge-approver') },

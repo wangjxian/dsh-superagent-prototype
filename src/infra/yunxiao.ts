@@ -34,49 +34,64 @@ export const tokenCommand = (cli: string, args: readonly string[]): string => `$
 /** The argument list a probe or the forwarding script runs to call the yunxiao CLI with the token in place. */
 export const tokenArgv = (cli: string, args: readonly string[]): string[] => ['sh', '-c', tokenCommand(cli, args)]
 
+/** How many branches one `codeup-list-branches` page asks for: the CLI's largest page, as a repository keeps hundreds. */
+export const BRANCH_PAGE_SIZE = 100
+/** The merge type a merge request merges with when the receiving rules name none: a merge commit, Codeup's own default. */
+export const DEFAULT_MERGE_TYPE = 'no-fast-forward'
 /** Subcommands dsh-superagent calls, by purpose, with the flags this installation expects. */
 export const YUNXIAO = {
   /** The account the token belongs to. */
   user: () => ['devops', 'base-get-user-by-token'],
-  /** One repository, with the caller's permission on it. */
-  repository: (organization: string, path: string) => ['devops', 'codeup-get-repository', '--organization-id', organization, '--repository-path', path],
-  /** A repository's branches. */
-  branches: (organization: string, repositoryId: string) => ['devops', 'codeup-list-branches', '--organization-id', organization, '--repository-id', repositoryId],
+  /** One repository, with the caller's permission on it; the API takes the full path URL-encoded in place of the id. */
+  repository: (organization: string, path: string) =>
+    ['devops', 'codeup-get-repository', '--organization-id', organization, '--repository-id', encodeURIComponent(path)],
+  /** One page of a repository's branches, narrowed to the names containing `search` when it is given. */
+  branches: (organization: string, repositoryId: string, page: number, search?: string) =>
+    ['devops', 'codeup-list-branches', '--organization-id', organization, '--repository-id', repositoryId, '--page', String(page),
+      '--per-page', String(BRANCH_PAGE_SIZE), ...search ? ['--search', search] : []],
   /** Creates a branch from another. */
   createBranch: (organization: string, repositoryId: string, branch: string, source: string) =>
-    ['devops', 'codeup-create-branch', '--organization-id', organization, '--repository-id', repositoryId, '--branch-name', branch, '--source-branch', source],
+    ['devops', 'codeup-create-branch', '--organization-id', organization, '--repository-id', repositoryId, '--branch', branch, '--ref', source],
   /** How many commits `to` is ahead of `from`; zero means `to` has merged back into `from`. */
   compare: (organization: string, repositoryId: string, from: string, to: string) =>
     ['devops', 'codeup-get-compare', '--organization-id', organization, '--repository-id', repositoryId, '--from', from, '--to', to],
+  /** The latest merge requests merged in a repository, newest first, which shows whether a release ever received one. */
+  mergedChangeRequests: (organization: string, repositoryId: string) =>
+    ['devops', 'codeup-list-change-requests', '--organization-id', organization, '--project-ids', repositoryId, '--state', 'merged',
+      '--order-by', 'updated_at', '--sort', 'desc', '--per-page', '100'],
   /** One merge request. */
   changeRequest: (organization: string, repositoryId: string, localId: number) =>
     ['devops', 'codeup-get-change-request', '--organization-id', organization, '--repository-id', repositoryId, '--local-id', String(localId)],
-  /** One file's content, or a directory listing, of a repository. */
-  fileBlobs: (organization: string, repositoryId: string, path: string) =>
-    ['devops', 'codeup-get-file-blobs', '--organization-id', organization, '--repository-id', repositoryId, '--file-path', path],
-  /** Work items of an organization matching a filter body, one page at a time. */
-  searchWorkitems: (organization: string, body: unknown) =>
-    ['devops', 'projex-search-workitems', '--organization-id', organization, '--body', JSON.stringify(body)],
+  /** A merge request's patch sets: the latest `MERGE_SOURCE` one names its head commit and the id its CI checks are read by. */
+  patchSets: (organization: string, repositoryId: string, localId: number) =>
+    ['devops', 'codeup-list-change-request-patch-sets', '--organization-id', organization, '--repository-id', repositoryId, '--local-id', String(localId)],
+  /** One file's content of a repository at `ref`. */
+  fileBlobs: (organization: string, repositoryId: string, path: string, ref: string) =>
+    ['devops', 'codeup-get-file-blobs', '--organization-id', organization, '--repository-id', repositoryId, '--file-path', path, '--ref', ref],
+  /** One page of one category's work items of a project matching `conditions`, a condition-group JSON string. */
+  searchWorkitems: (organization: string, query: { category: string; spaceId: string; conditions: string; page: number; perPage: number }) =>
+    ['devops', 'projex-search-workitems', '--organization-id', organization, '--category', query.category, '--space-id', query.spaceId,
+      '--conditions', query.conditions, '--page', String(query.page), '--per-page', String(query.perPage), '--order-by', 'gmtModified', '--sort', 'asc'],
   /** One work item, with its description, status, assignee and category. */
-  workitem: (organization: string, id: string) => ['devops', 'projex-get-workitem', '--organization-id', organization, '--workitem-id', id],
+  workitem: (organization: string, id: string) => ['devops', 'projex-get-workitem', '--organization-id', organization, '--id', id],
   /** Every comment of a work item in one report. */
   workitemComments: (organization: string, id: string) =>
-    ['devops', 'projex-list-workitem-comments', '--organization-id', organization, '--workitem-id', id],
+    ['devops', 'projex-list-workitem-comments', '--organization-id', organization, '--id', id],
   /** Writes a comment as the agent account. */
   createWorkitemComment: (organization: string, id: string, content: string) =>
-    ['devops', 'projex-create-workitem-comment', '--organization-id', organization, '--workitem-id', id, '--content', content],
+    ['devops', 'projex-create-workitem-comment', '--organization-id', organization, '--id', id, '--content', content],
   /** Changes fields of a work item; `status` is the only one dsh-superagent writes. */
   updateWorkitem: (organization: string, id: string, body: unknown) =>
-    ['devops', 'projex-update-workitem', '--organization-id', organization, '--workitem-id', id, '--biz-body', JSON.stringify(body)],
-  /** The work items related to one, such as the requirement it serves. */
-  workitemRelations: (organization: string, id: string) =>
-    ['devops', 'projex-list-workitem-relation-records', '--organization-id', organization, '--workitem-id', id],
-  /** The workflow of a work item: the statuses it may take, by id. */
-  workitemWorkflow: (organization: string, id: string) =>
-    ['devops', 'projex-get-workitem-workflow', '--organization-id', organization, '--workitem-id', id],
+    ['devops', 'projex-update-workitem', '--organization-id', organization, '--id', id, '--biz-body', JSON.stringify(body)],
+  /** The work items related to one by `relationType`, such as `PARENT` or the `ASSOCIATED` requirement it serves. */
+  workitemRelations: (organization: string, id: string, relationType: string) =>
+    ['devops', 'projex-list-workitem-relation-records', '--organization-id', organization, '--id', id, '--relation-type', relationType],
+  /** The workflow of a work item in its project: the statuses it may take, by id. */
+  workitemWorkflow: (organization: string, id: string, projectId: string) =>
+    ['devops', 'projex-get-workitem-workflow', '--organization-id', organization, '--id', id, '--project-id', projectId],
   /** The activity log of a work item, which names who changed it. */
   workitemActivities: (organization: string, id: string) =>
-    ['devops', 'projex-list-workitem-activities', '--organization-id', organization, '--workitem-id', id],
+    ['devops', 'projex-list-workitem-activities', '--organization-id', organization, '--id', id],
   /** Opens a merge request. */
   createChangeRequest: (organization: string, repositoryId: string) =>
     ['devops', 'codeup-create-change-request', '--organization-id', organization, '--repository-id', repositoryId],
@@ -87,12 +102,17 @@ export const YUNXIAO = {
   /** Every comment of a merge request in one report. */
   changeRequestComments: (organization: string, repositoryId: string, localId: number) =>
     ['devops', 'codeup-list-merge-request-comments', '--organization-id', organization, '--repository-id', repositoryId, '--local-id', String(localId)],
-  /** The CI checks of a merge request's latest commit. */
-  changeRequestChecks: (organization: string, repositoryId: string, localId: number) =>
-    ['devops', 'codeup-list-change-request-ci-check-list', '--organization-id', organization, '--repository-id', repositoryId, '--local-id', String(localId)],
+  /** The CI checks of one patch set of a merge request, which `patchSets` names. */
+  changeRequestChecks: (organization: string, repositoryId: string, localId: number, patchSet: string) =>
+    ['devops', 'codeup-list-change-request-ci-check-list', '--organization-id', organization, '--repository-id', repositoryId, '--local-id', String(localId),
+      '--patch-set-biz-id', patchSet],
   /** Merges a merge request; the host runs it alone, after a person confirmed the target release. */
-  mergeChangeRequest: (organization: string, repositoryId: string, localId: number) =>
-    ['devops', 'codeup-merge-change-request', '--organization-id', organization, '--repository-id', repositoryId, '--local-id', String(localId)],
+  mergeChangeRequest: (organization: string, repositoryId: string, localId: number, mergeType: string) =>
+    ['devops', 'codeup-merge-change-request', '--organization-id', organization, '--repository-id', repositoryId, '--local-id', String(localId),
+      '--merge-type', mergeType],
+  /** Closes a merge request without merging; the host closes the one a retarget replaced, once its replacement merged. */
+  closeChangeRequest: (organization: string, repositoryId: string, localId: number) =>
+    ['devops', 'codeup-close-change-request', '--organization-id', organization, '--repository-id', repositoryId, '--local-id', String(localId)],
   /** The pipelines of the organization, which a worker searches by name for the environment it deploys to. */
   pipelines: (organization: string) => ['devops', 'flow-list-pipelines', '--organization-id', organization],
   /** One pipeline, with the name whose prefix decides whether a worker may run it. */
@@ -102,27 +122,24 @@ export const YUNXIAO = {
   pipelineRuns: (organization: string, pipelineId: string) =>
     ['devops', 'flow-list-pipeline-runs', '--organization-id', organization, '--pipeline-id', pipelineId],
   /** One run with its jobs and their states. */
-  pipelineRun: (organization: string, runId: string) =>
-    ['devops', 'flow-get-pipeline-run', '--organization-id', organization, '--pipeline-run-id', runId],
-  /** One task of a run, whose pipeline a retry names when the run itself is not addressable by the task's id. */
-  pipelineJobRun: (organization: string, jobId: string) =>
-    ['devops', 'flow-get-pipeline-job-run', '--organization-id', organization, '--job-run-id', jobId],
+  pipelineRun: (organization: string, pipelineId: string, runId: string) =>
+    ['devops', 'flow-get-pipeline-run', '--organization-id', organization, '--pipeline-id', pipelineId, '--pipeline-run-id', runId],
   /** A run's task log, which tells a code failure from an occasional one. */
-  pipelineJobLog: (organization: string, jobId: string) =>
-    ['devops', 'flow-get-pipeline-job-run-log', '--organization-id', organization, '--job-run-id', jobId],
+  pipelineJobLog: (organization: string, pipelineId: string, runId: string, jobId: string) =>
+    ['devops', 'flow-get-pipeline-job-run-log', '--organization-id', organization, '--pipeline-id', pipelineId, '--pipeline-run-id', runId, '--job-id', jobId],
   /** Starts a run of a pipeline. */
   createPipelineRun: (organization: string, pipelineId: string) =>
     ['devops', 'flow-create-pipeline-run', '--organization-id', organization, '--pipeline-id', pipelineId],
   /** Retries a failed task of a run. */
-  retryPipelineJob: (organization: string, jobId: string) =>
-    ['devops', 'flow-retry-pipeline-job-run', '--organization-id', organization, '--job-run-id', jobId],
+  retryPipelineJob: (organization: string, pipelineId: string, runId: string, jobId: string) =>
+    ['devops', 'flow-retry-pipeline-job-run', '--organization-id', organization, '--pipeline-id', pipelineId, '--pipeline-run-id', runId, '--job-id', jobId],
   /** Reruns a task of a run from the start. */
-  rerunPipelineJob: (organization: string, jobId: string) =>
-    ['devops', 'flow-rerun-pipeline-job-run', '--organization-id', organization, '--job-run-id', jobId],
-  /** Changes a merge request, such as its target branch; used when a delivery is moved to another release. */
-  updateChangeRequest: (organization: string, repositoryId: string, localId: number, body: unknown) =>
+  rerunPipelineJob: (organization: string, pipelineId: string, runId: string, jobId: string) =>
+    ['devops', 'flow-rerun-pipeline-job-run', '--organization-id', organization, '--pipeline-id', pipelineId, '--pipeline-run-id', runId, '--job-id', jobId],
+  /** Changes a merge request's title or description; Codeup cannot move one to another target branch. */
+  updateChangeRequest: (organization: string, repositoryId: string, localId: number, fields: { title?: string; description?: string }) =>
     ['devops', 'codeup-update-change-request', '--organization-id', organization, '--repository-id', repositoryId, '--local-id', String(localId),
-      '--body', JSON.stringify(body)],
+      ...fields.title !== undefined ? ['--title', fields.title] : [], ...fields.description !== undefined ? ['--description', fields.description] : []],
 } as const
 /** Subcommands that only read, as shell globs: `Commands.aliyun` retries them, and the workers' forwarding script lets them through. */
 export const READ_ONLY_GLOBS: readonly string[] = ['base-get-*', 'codeup-get-*', 'codeup-list-*', 'projex-get-*', 'projex-list-*',

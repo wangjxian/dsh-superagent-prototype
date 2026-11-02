@@ -7,39 +7,19 @@ import { z } from 'zod'
 import type { CodeupAccount, CodeupRepository } from '../deployment.ts'
 import type { Change, ClaimInput, Hosting } from '../hosting.ts'
 import { ticketBranch } from '../hosting.ts'
-import type { Commands } from '../infra/commands.ts'
 import { sameName } from '../infra/text.ts'
 import { YUNXIAO } from '../infra/yunxiao.ts'
+import { readMergeRequest } from './yunxiao-mr.ts'
 
 /** The Source a Codeup change's Thread belongs to; the work-item Source of a later phase owns it. */
 export const CODEUP_SOURCE = 'yunxiao'
-/** The web page of a merge request, as Codeup writes it for the organization. */
-export const codeupUrl = (account: CodeupAccount, repository: CodeupRepository, localId: number): string =>
-  `https://codeup.aliyun.com/${account.organization}/${repository.path}/change/${localId}`
+/** The web page of a merge request; a repository's path already starts with its organization. */
+export const codeupUrl = (repository: CodeupRepository, localId: number): string =>
+  `https://codeup.aliyun.com/${repository.path}/change/${localId}`
 /** Resolves a repository the caller names by id or by group path. */
 export const repositoryOf = (account: CodeupAccount, repository: string): CodeupRepository | undefined =>
   account.repositories.find(item => item.id === repository || item.path === repository || item.name === repository)
 
-const MergeRequestSchema = z.looseObject({
-  localId: z.number().int().positive(),
-  title: z.string().nullish(),
-  sourceBranch: z.string().nullish(),
-  targetBranch: z.string().nullish(),
-  sourceCommitSha: z.string().nullish(),
-  state: z.string().nullish(),
-  webUrl: z.string().nullish(),
-  createdAt: z.string().nullish(),
-  mergedAt: z.string().nullish(),
-  closedAt: z.string().nullish(),
-  workItemIds: z.array(z.union([z.string(), z.number()]).transform(String)).nullish(),
-  author: z.looseObject({ id: z.union([z.string(), z.number()]).transform(String), name: z.string().nullish() }).nullish(),
-})
-/** Normalizes Codeup's merge-request states onto the platform-neutral ones. */
-const stateOf = (state: string | null | undefined, mergedAt: string | null | undefined): Change['state'] => {
-  const value = (state ?? '').toUpperCase()
-  if (value === 'MERGED' || mergedAt) return 'merged'
-  return value === 'CLOSED' ? 'closed' : 'open'
-}
 const FileBlobSchema = z.looseObject({
   content: z.string().nullish(), encoding: z.string().nullish(), path: z.string().nullish(),
   children: z.array(z.looseObject({ name: z.string(), type: z.string().nullish() })).nullish(),
@@ -63,7 +43,7 @@ export function codeupHosting(account: CodeupAccount): Hosting {
     repositories,
     readPath: async (commands, repository, path, kind) => {
       const target = resolved(repository ?? repositories[0] ?? '')
-      const text = await commands.aliyun(YUNXIAO.fileBlobs(account.organization, target.id, path))
+      const text = await commands.aliyun(YUNXIAO.fileBlobs(account.organization, target.id, path, target.defaultBranch ?? 'master'))
       const blob = z.union([FileBlobSchema, z.array(FileBlobSchema)]).parse(JSON.parse(text.slice(Math.max(0, text.indexOf('{')))))
       const one = Array.isArray(blob) ? blob[0] : blob
       if (!one) throw new Error(`${path} has no content in ${target.path}`)
@@ -78,19 +58,19 @@ export function codeupHosting(account: CodeupAccount): Hosting {
     },
     readChange: async (commands, repository, number, signal) => {
       const target = resolved(repository)
-      const request = await commands.withSignal(signal).aliyun(MergeRequestSchema, YUNXIAO.changeRequest(account.organization, target.id, number))
-      return { repository: target.id, number: request.localId, url: request.webUrl ?? codeupUrl(account, target, request.localId),
-        title: request.title ?? '', state: stateOf(request.state, request.mergedAt), author: request.author?.id ?? '',
-        headRef: request.sourceBranch ?? '', baseRef: request.targetBranch ?? '', headSha: request.sourceCommitSha ?? '',
-        ...request.createdAt ? { createdAt: request.createdAt } : {}, ...request.mergedAt ? { mergedAt: request.mergedAt } : {},
-        ...request.closedAt ? { closedAt: request.closedAt } : {}, ...request.workItemIds?.length ? { workItemIds: request.workItemIds } : {} }
+      // The merge request is read the way the poller and the merge approval read it, so all three agree on its state and head.
+      const request = await readMergeRequest(commands.withSignal(signal), account.organization, { repositoryId: target.id, localId: number })
+      const ended = request.endedAt ? request.state === 'merged' ? { mergedAt: request.endedAt } : request.state === 'closed' ? { closedAt: request.endedAt } : {} : {}
+      return { repository: target.id, number, url: request.url || codeupUrl(target, number), title: request.title, state: request.state,
+        author: request.author, headRef: request.source, baseRef: request.target, headSha: request.head,
+        ...request.createdAt ? { createdAt: request.createdAt } : {}, ...ended, ...request.workItemIds?.length ? { workItemIds: request.workItemIds } : {} }
     },
-    claim: ({ ticket, change, source }: ClaimInput) => {
+    claim: ({ ticket, change, source, serial }: ClaimInput) => {
       const started = !!source && sameName(source.repository, change.repository) && source.number === change.number
-      const opened = sameName(change.author, account.account.id) && ticketBranch(ticket, change.headRef)
+      const opened = sameName(change.author, account.account.id) && ticketBranch(ticket, change.headRef, serial)
         && account.repositories.some(item => item.id === change.repository)
       if (!started && !opened) {
-        return { refused: `The merge request does not belong to this ticket: report the ticket's own merge request, or one by ${account.account.name} from a branch that names DSH_SUPERAGENT_NAME` }
+        return { refused: `The merge request does not belong to this ticket: report the ticket's own merge request, or one by ${account.account.name} from a branch that ends with DSH_SUPERAGENT_NAME or the work item's serial` }
       }
       return { own: opened }
     },

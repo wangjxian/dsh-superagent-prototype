@@ -63,8 +63,11 @@ export const SETUP_FIELDS: Readonly<Record<string, readonly string[]>> = {
 }
 
 export interface GithubAccount { cli: string; login: string; noreply: string }
-/** One repository of the Codeup workspace a ticket may deliver to: its id, its group path and its local directory name. */
-export interface CodeupRepository { id: string; path: string; name: string }
+/**
+ * One repository of the Codeup workspace a ticket may deliver to: its id, its group path, its local directory name, and the
+ * default branch releases are cut from, when Codeup reports one.
+ */
+export interface CodeupRepository { id: string; path: string; name: string; defaultBranch?: string }
 /** The resolved Codeup account: the CLI that reaches the organization, and the workspace repositories it may push to. */
 export interface CodeupAccount {
   cli: string
@@ -155,7 +158,9 @@ const YunxiaoUser = z.looseObject({
 })
 const WorkspaceRepository = z.looseObject({
   id: z.union([z.string(), z.number()]).transform(String),
-  name: z.string().nullish(), path: z.string().nullish(),
+  name: z.string().nullish(), path: z.string().nullish(), pathWithNamespace: z.string().nullish(), defaultBranch: z.string().nullish(),
+  // Codeup reports a member's role as `accessLevel` (30 developer, 40 master); `allowPush` is a push-rule flag, not the role.
+  accessLevel: z.union([z.string(), z.number()]).nullish(),
   canPush: z.boolean().nullish(), permission: z.string().nullish(),
   permissions: z.looseObject({ push: z.boolean().nullish() }).nullish(),
 })
@@ -166,7 +171,8 @@ export const codeupPath = (remote: string): string | undefined => {
 }
 /** Whether the repository API reports push access, by whichever field it fills; undefined when it reports none. */
 const canPush = (repository: z.infer<typeof WorkspaceRepository>): boolean | undefined =>
-  repository.canPush ?? repository.permissions?.push ?? (repository.permission ? /write|admin|owner/i.test(repository.permission) : undefined)
+  (repository.accessLevel != null && repository.accessLevel !== '' ? Number(repository.accessLevel) >= 30 : undefined)
+    ?? repository.canPush ?? repository.permissions?.push ?? (repository.permission ? /write|admin|owner/i.test(repository.permission) : undefined)
 /** What a failed probe printed, preferring the command's own standard error over the wrapper's message about it. */
 const detail = (error: unknown): string => {
   const stderr = error && typeof error === 'object' && 'stderr' in error && typeof error.stderr === 'string' ? error.stderr : undefined
@@ -190,7 +196,8 @@ async function workspaceRepositories(workspace: string, organization: string, cl
     const access = parsed(WorkspaceRepository, text)
     if (!access) throw new SetupError('codeupRepositoryUnreadable', { repository: path, output: text.slice(0, 500) })
     if (canPush(access) !== true) { refused.push(path); continue }
-    repositories.push({ id: access.id, path: access.path ?? path, name: entry.name })
+    repositories.push({ id: access.id, path: access.pathWithNamespace ?? path, name: entry.name,
+      ...access.defaultBranch ? { defaultBranch: access.defaultBranch } : {} })
   }
   if (!repositories.length) throw new SetupError('codeupNoRepositories', { workspace, refused: refused.join(', ') })
   return repositories

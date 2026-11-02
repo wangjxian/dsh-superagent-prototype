@@ -29,7 +29,7 @@ const FIELD = {
   serial: ['serialNumber', 'identifier', 'serial', 'code'],
   title: ['subject', 'title', 'name'],
   description: ['description', 'content', 'detail', 'descriptionHtml'],
-  category: ['categoryIdentifier', 'category', 'workitemTypeIdentifier', 'typeIdentifier'],
+  category: ['categoryId', 'categoryIdentifier', 'category', 'workitemTypeIdentifier', 'typeIdentifier'],
   status: ['status', 'statusIdentifier', 'statusName'],
   assignee: ['assignedTo', 'assignee', 'assignedToUser', 'owner'],
   project: ['spaceIdentifier', 'spaceId', 'projectId', 'projectIdentifier'],
@@ -52,6 +52,21 @@ export const AGENT_MARKER = AGENT_COMMENT.split('\n')[0]!
 /** Whether a comment body carries the marker, which no person writes, so the comment is the agent's own. */
 export const isAgentComment = (body: string): boolean => body.includes(AGENT_MARKER)
 /** The work item's web page, which the Source's link builder and every trigger share. */
+/**
+ * The words that refuse a triage question, wherever they sit in the reply: a person who says the work waits, or names what it
+ * waits for, decided against starting it now. A message that says both kinds of thing reads as a refusal, because starting
+ * work nobody asked for is the worse mistake.
+ */
+export const TRIAGE_NO = new RegExp(['不可以', '不能', '不行', '没法', '不做', '不用', '不接', '别做', '不开始', '别开始',
+  '不开工', '别开工', '先别', '跳过', '先不', '暂不', '暂缓', '缓一下', '待定', '等一下', '等等', '不处理', '先放着',
+  '等[^。！？\\n]{0,12}确认'].join('|'), 'i')
+/**
+ * The words that start the work item, which decide only as the reply's first word: `开始之前先问下产品` and `还不能开始` are no
+ * start, and `looks good` carries `go` inside another word.
+ */
+export const TRIAGE_GO = /^(开工|开始|可以|做吧|ok|go)[吧啊呀哈]?(?:$|[\s，,。.!！：:；;])/i
+/** A bare approval carries nothing beyond the decision, so no supplement travels with it. */
+export const TRIAGE_BARE = /^(开工|开始|可以|做吧|go|ok)[。.!！]*$/i
 export const workitemUrl = (id: string): string => `https://devops.aliyun.com/projex/workitem/${encodeURIComponent(id)}`
 
 /** Deterministic trigger ID of one repair cycle of a work item, so reading the same cycle twice never opens a second ticket. */
@@ -152,7 +167,8 @@ export function workitemOf(raw: unknown, projectId?: string): Workitem {
   if (!id) throw new Error('The yunxiao work item has no id; the CLI response shape may have changed')
   const title = stringOf(first(item, FIELD.title))
   if (!title) throw new Error(`The yunxiao work item ${id} has no title; the CLI response shape may have changed`)
-  const status = stringOf(first(item, FIELD.status))
+  // Projex reports the status as an object (`{ id: '29', name: '已修复' }`); the receiving rules compare its id.
+  const status = idOf(first(item, FIELD.status))
   if (!status) throw new Error(`The yunxiao work item ${id} has no status; the receiving rules compare status IDs`)
   const project = stringOf(first(item, FIELD.project)) ?? idOf(first(item, FIELD.projectObject)) ?? projectId
   if (!project) throw new Error(`The yunxiao work item ${id} has no project; the receiving rules are configured per project`)
@@ -203,13 +219,16 @@ export function relationOf(raw: unknown, self: string): WorkitemRelation | undef
  * Builds the trigger for a work item assigned to the agent's account, which is the request itself.
  * `agent` names that account: the assignment counts as a person's request even though the assignee is the account the
  * agent acts as, so it does not change `human`.
+ * `channel` is where the ticket's own messages go, the work item unless the Source names the approver's direct message: a
+ * person then hears about the work item in Feishu instead of on a colleague's work item.
  */
-export function workitemTrigger(item: Workitem, actor: string, cycle: number, agent: string): Trigger {
+export function workitemTrigger(item: Workitem, actor: string, cycle: number, agent: string,
+  channel: ChannelRef = workitemChannel(item.id)): Trigger {
   return { id: workitemTriggerId(item.id, cycle), source: SOURCE, threads: [workitemThread(item.id)],
     actor: { source: SOURCE, id: actor }, human: true, addressed: 'mention',
     at: item.modifiedAt || new Date().toISOString(),
     text: [[item.serial, item.title].filter(Boolean).join(' '), item.description].filter(Boolean).join('\n\n'),
-    channel: workitemChannel(item.id), url: item.url,
+    channel, url: item.url,
     meta: { workitemId: item.id, serial: item.serial, category: item.category, projectId: item.projectId, status: item.status, cycle } }
 }
 /**

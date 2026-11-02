@@ -1,12 +1,12 @@
 import { execFile, spawn } from 'node:child_process'
-import { chmodSync, mkdirSync, mkdtempSync, readdirSync, readFileSync, rmSync, symlinkSync, writeFileSync } from 'node:fs'
+import { chmodSync, mkdirSync, mkdtempSync, readdirSync, readFileSync, rmSync, statSync, symlinkSync, writeFileSync } from 'node:fs'
 import { tmpdir } from 'node:os'
 import { join } from 'node:path'
 import { promisify } from 'node:util'
 import { afterEach, beforeEach, describe, expect, it, vi } from 'vitest'
 import { SENSITIVE_ENV_PATTERN, type SubprocessRuntime } from '@deepseek-ai/dsh-subprocess'
 import { CODEUP_URL, GIT_LOCATION, agentVariables, credentialHelper, runAsWorker, verifyDirectory, verifyEnvironment, withoutDirectory, workerBin,
-  workerGitConfig, workerHooks, writeEnvironment } from '../src/infra/environment.ts'
+  workerGitConfig, workerHooks, workerPipelines, writeEnvironment, writeWorkerPipelines } from '../src/infra/environment.ts'
 import { CliError } from '../src/infra/commands.ts'
 import { TOKEN_MISSING, TOKEN_MISSING_STATUS, YUNXIAO } from '../src/infra/yunxiao.ts'
 import { testCodeup, testDeployment } from './fixtures/deployment.ts'
@@ -23,15 +23,14 @@ const aliyunProgram = (path: string): string => program(path, 'printf "%s\\n" "t
 const pipelineFake = (path: string, log: string): string => program(path, [
   `echo "$*" >> ${log}`,
   'case "$*" in',
-  `  "devops flow-get-pipeline --organization-id org-1 --pipeline-id 11") echo '{"id":11,"name":"pre-axo-manager-x64"}' ;;`,
+  `  "devops flow-get-pipeline --organization-id org-1 --pipeline-id 11") echo '{"id":11,"pipelineName":"pre-axo-manager-x64"}' ;;`,
   `  "devops flow-get-pipeline --organization-id org-1 --pipeline-id 12") echo '{"data":{"pipelineName":"prod-axo-manager-x64"}}' ;;`,
-  `  "devops flow-get-pipeline --organization-id org-1 --pipeline-id 13") echo '{"name":"prod-pre-axo-manager-x64"}' ;;`,
-  `  "devops flow-get-pipeline --organization-id org-1 --pipeline-id 14") echo '{"name":"staging-axo"}' ;;`,
+  `  "devops flow-get-pipeline --organization-id org-1 --pipeline-id 13") echo '{"pipeline":{"name":"prod-pre-axo-manager-x64"}}' ;;`,
+  `  "devops flow-get-pipeline --organization-id org-1 --pipeline-id 14") echo '{"pipeline":{"name":"staging-axo"}}' ;;`,
   `  "devops flow-get-pipeline --organization-id org-1 --pipeline-id 15") echo 'not json' ;;`,
-  `  "devops flow-get-pipeline-run --organization-id org-1 --pipeline-run-id 33") echo '{"pipeline":{"id":11,"name":"qa-axo-manager-x64"}}' ;;`,
-  `  "devops flow-get-pipeline-run --organization-id org-1 --pipeline-run-id 34") echo '{"pipeline":{"name":"prod-axo-manager-x64"}}' ;;`,
-  `  "devops flow-get-pipeline-run --organization-id org-1 --pipeline-run-id 35") exit 3 ;;`,
-  `  "devops flow-get-pipeline-run --organization-id org-1 --pipeline-run-id 36") echo '{"name":"run-1","pipeline":{"id":11,"name":"qa-axo-manager-x64"}}' ;;`,
+  `  "devops flow-get-pipeline --organization-id org-1 --pipeline-id 16") echo '{"id":16,"name":"run-1"}' ;;`,
+  `  "devops flow-get-pipeline --organization-id org-1 --pipeline-id 17") echo '{"pipelineName":"PRE-Axo-Manager-X64"}' ;;`,
+  `  "devops flow-get-pipeline --organization-id org-1 --pipeline-id 18") echo '{"pipeline":{"pipelineName":"qa-axo-manager-x64"}}' ;;`,
   '  *) printf "OK %s\\n" "$*" ;;',
   'esac',
 ].join('\n'))
@@ -185,6 +184,9 @@ describe('aliyun forwarding script', () => {
       'devops flow-create-pipeline-run --organization-id org-1 --pipeline-id 11'])
     // The `--flag=value` spelling is read too.
     await expect(aliyun(['devops', 'flow-create-pipeline-run', '--pipeline-id=11'])).resolves.toBeTruthy()
+    // A name is compared without case, and a nested `pipeline.pipelineName` names the pipeline too.
+    await expect(aliyun(['devops', 'flow-create-pipeline-run', '--pipeline-id', '17'])).resolves.toBeTruthy()
+    await expect(aliyun(['devops', 'flow-create-pipeline-run', '--pipeline-id', '18'])).resolves.toBeTruthy()
     // prod-, prod-pre-, and any other name are the host's to run, once the approver confirms.
     for (const id of ['12', '13', '14']) {
       await expect(aliyun(['devops', 'flow-create-pipeline-run', '--pipeline-id', id]))
@@ -194,8 +196,9 @@ describe('aliyun forwarding script', () => {
   it('refuses a pipeline whose name it cannot learn, instead of starting its run', async () => {
     const log = join(dir, 'calls')
     await setupPipelines(log)
-    // A reply without a name, a lookup that answers nothing, and a call that names no pipeline are all refusals.
-    for (const args of [['--pipeline-id', '15'], ['--pipeline-id', '99'], []]) {
+    // A reply without a pipeline name (16 names only a run), a lookup that answers nothing, and a call that names no pipeline are
+    // all refusals.
+    for (const args of [['--pipeline-id', '15'], ['--pipeline-id', '16'], ['--pipeline-id', '99'], []]) {
       await expect(aliyun(['devops', 'flow-create-pipeline-run', ...args]))
         .rejects.toMatchObject({ code: 1, stderr: expect.stringContaining('orchestrator_request_pipeline') })
     }
@@ -205,16 +208,47 @@ describe('aliyun forwarding script', () => {
     expect(calls).toContain('devops flow-get-pipeline --organization-id org-1 --pipeline-id 15')
     expect(calls).not.toContain('--pipeline-id 99 ')
   })
-  it('asks a job run\'s pipeline name before retrying or rerunning it, and refuses a prod- one', async () => {
+  it('reads the prefixes the settings wrote, and falls back to the defaults without the file', async () => {
     const log = join(dir, 'calls')
     await setupPipelines(log)
-    // A retry names its run, whose pipeline decides: qa- passes, prod- and an unreadable run do not.
-    await expect(aliyun(['devops', 'flow-retry-pipeline-job-run', '--job-run-id', '33'])).resolves.toBeTruthy()
-    expect(readFileSync(log, 'utf8')).toContain('devops flow-get-pipeline-run --organization-id org-1 --pipeline-run-id 33')
-    // A run whose own `name` comes first is still read through its `pipeline` object.
-    await expect(aliyun(['devops', 'flow-retry-pipeline-job-run', '--job-run-id', '36'])).resolves.toBeTruthy()
-    for (const [command, id] of [['flow-rerun-pipeline-job-run', '34'], ['flow-retry-pipeline-job-run', '35']] as const) {
-      await expect(aliyun(['devops', command, '--job-run-id', id]))
+    const create = (id: string) => aliyun(['devops', 'flow-create-pipeline-run', '--pipeline-id', id])
+    // The file a start leaves names the settings' defaults.
+    expect(readFileSync(workerPipelines(dir), 'utf8')).toContain('qa-\npre-')
+    // A settings write narrows what a worker may run, without a restart.
+    await writeWorkerPipelines(dir, ['staging-'])
+    await expect(create('14')).resolves.toBeTruthy()
+    await expect(create('11')).rejects.toMatchObject({ code: 1, stderr: expect.stringContaining('orchestrator_request_pipeline') })
+    // Blank lines and comments are ignored, and both sides are compared without case.
+    writeFileSync(workerPipelines(dir), `${'# Written by dsh-superagent on every start; edits are lost.'}\n\n  Staging-  \n# QA-\n`)
+    await expect(create('14')).resolves.toBeTruthy()
+    // Without the file, the defaults apply again.
+    rmSync(workerPipelines(dir))
+    await expect(create('11')).resolves.toBeTruthy()
+    await expect(create('14')).rejects.toMatchObject({ code: 1, stderr: expect.stringContaining('orchestrator_request_pipeline') })
+    // A file that names no prefix falls back to the defaults as well.
+    writeFileSync(workerPipelines(dir), `${'# Written by dsh-superagent on every start; edits are lost.'}\n\n`)
+    await expect(create('11')).resolves.toBeTruthy()
+  })
+  it('refuses a pipelines file it did not write, and keeps the prefixes a settings write put there', async () => {
+    writeFileSync(workerPipelines(dir), 'staging-\n')
+    await expect(writeEnvironment(testDeployment({ stateDir: dir }), [])).rejects.toThrow(`${workerPipelines(dir)} was not written by dsh-superagent`)
+    rmSync(workerPipelines(dir))
+    // A settings write outlives a restart: the next start leaves the prefixes alone.
+    await writeEnvironment(testDeployment({ stateDir: dir }), [])
+    await writeWorkerPipelines(dir, ['staging-'])
+    await writeEnvironment(testDeployment({ stateDir: dir }), [])
+    expect(readFileSync(workerPipelines(dir), 'utf8')).toContain('staging-')
+  })
+  it('asks the pipeline name of a task before retrying or rerunning it, and refuses a prod- one', async () => {
+    const log = join(dir, 'calls')
+    await setupPipelines(log)
+    // A retry names its pipeline, run and task; the pipeline decides: pre- passes, prod- and an unreadable one do not.
+    const task = (pipeline: string): string[] => ['--pipeline-id', pipeline, '--pipeline-run-id', '33', '--job-id', '7']
+    await expect(aliyun(['devops', 'flow-retry-pipeline-job-run', ...task('11')])).resolves.toBeTruthy()
+    expect(readFileSync(log, 'utf8')).toContain('devops flow-get-pipeline --organization-id org-1 --pipeline-id 11')
+    for (const [command, args] of [['flow-rerun-pipeline-job-run', task('12')], ['flow-retry-pipeline-job-run', task('15')],
+      ['flow-retry-pipeline-job-run', ['--pipeline-run-id', '33', '--job-id', '7']]] as const) {
+      await expect(aliyun(['devops', command, ...args]))
         .rejects.toMatchObject({ code: 1, stderr: expect.stringContaining('orchestrator_request_pipeline') })
     }
     // The read-only lookups stay a worker's.

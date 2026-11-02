@@ -114,7 +114,7 @@ describe('codeup setup', () => {
   }
   /** The fake aliyun CLI: the account, the repository, and whatever the test makes either answer. */
   const aliyun = (answers: { user?: string; repository?: string } = {}): string =>
-    program(join(dir, 'bin', 'aliyun'), `case "$*" in\n  "devops base-get-user-by-token") ${answers.user ?? `echo '{"id":"62cf7f1d29d72730d9acc32d","username":"yedou","email":"yedou@example.com"}'`} ;;\n  "devops codeup-get-repository --organization-id org-1 --repository-path group/app") ${answers.repository ?? `echo '{"id":"451f7a12","path":"group/app","permissions":{"push":true}}'`} ;;\n  *) exit 1 ;;\nesac`)
+    program(join(dir, 'bin', 'aliyun'), `case "$*" in\n  "devops base-get-user-by-token") ${answers.user ?? `echo '{"id":"62cf7f1d29d72730d9acc32d","username":"yedou","email":"yedou@example.com"}'`} ;;\n  "devops codeup-get-repository --organization-id org-1 --repository-id group%2Fapp") ${answers.repository ?? `echo '{"id":"451f7a12","pathWithNamespace":"group/app","accessLevel":"30","defaultBranch":"master"}'`} ;;\n  *) exit 1 ;;\nesac`)
   const ssh = (welcome = true): string => program(join(dir, 'bin', 'ssh'),
     welcome ? 'echo "Welcome to Codeup, yedou!" >&2; exit 1' : 'echo "Permission denied (publickey)." >&2; exit 255')
   // The token script calls the keychain tool by absolute path, so the probe points it at a stand-in instead.
@@ -122,7 +122,7 @@ describe('codeup setup', () => {
     { env: { PATH: path, HOME: dir } })).stdout
   // Built per test: the directories come from the `beforeEach` that runs before each one.
   const account = () => ({ cli: join(dir, 'bin', 'aliyun'), organization: 'org-1', workspace: join(dir, 'workspace'),
-    account: { id: '62cf7f1d29d72730d9acc32d', name: 'yedou', commitEmail: 'yedou@example.com' }, repositories: [{ id: '451f7a12', path: 'group/app', name: 'app' }] })
+    account: { id: '62cf7f1d29d72730d9acc32d', name: 'yedou', commitEmail: 'yedou@example.com' }, repositories: [{ id: '451f7a12', path: 'group/app', name: 'app', defaultBranch: 'master' }] })
   const codeup = (overrides: Record<string, unknown> = {}) => ({ cli: 'aliyun', organization: 'org-1', workspace: workspace(), ...overrides })
   beforeEach(async () => {
     program(join(dir, 'bin', 'security'), 'echo token-123')
@@ -155,7 +155,7 @@ describe('codeup setup', () => {
     ssh(false)
     await needs('codeupSshUnavailable', { output: expect.stringContaining('Permission denied') }, {})
     ssh()
-    aliyun({ repository: `echo '{"id":"451f7a12","path":"group/app","permissions":{"push":false}}'` })
+    aliyun({ repository: `echo '{"id":"451f7a12","pathWithNamespace":"group/app","accessLevel":"20"}'` })
     await needs('codeupNoRepositories', { workspace: join(dir, 'workspace'), refused: 'group/app' }, {})
     aliyun({ repository: 'echo "not a repository report"' })
     await needs('codeupRepositoryUnreadable', { repository: 'group/app' }, {})

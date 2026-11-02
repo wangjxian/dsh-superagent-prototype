@@ -4,7 +4,7 @@
  * Provides default-path guardrails rather than an OS-level security boundary, as workers run under the operator's OS user.
  */
 import { lstat, mkdir, readdir, readFile, rename, unlink, writeFile } from 'node:fs/promises'
-import { realpathSync } from 'node:fs'
+import { readFileSync, realpathSync } from 'node:fs'
 import { delimiter, join, resolve } from 'node:path'
 import type { SubprocessOutputReader, SubprocessRuntime } from '@deepseek-ai/dsh-subprocess'
 import type { Deployment } from '../deployment.ts'
@@ -21,6 +21,20 @@ export const workerBin = (stateDir: string): string => join(stateDir, 'worker-bi
 export const workerGitConfig = (stateDir: string): string => join(stateDir, 'worker-gitconfig')
 /** The hooks directory the agent's git configuration names, which replaces the hooks a repository keeps in `.git/hooks`. */
 export const workerHooks = (stateDir: string): string => join(stateDir, 'worker-hooks')
+/** The file naming the pipeline prefixes a worker may run; the host writes it from the settings, and the forwarding script reads it. */
+export const workerPipelines = (stateDir: string): string => join(stateDir, 'worker-pipelines')
+/** The prefixes a worker may run when the file above names none, matching the settings' default. */
+const DEFAULT_PIPELINE_PREFIXES: readonly string[] = ['qa-', 'pre-']
+/**
+ * The pipeline prefixes in force, read synchronously for a caller that judges one command right now; see `readWorkerPipelines`.
+ * An absent or empty file names none, and the caller falls back to the receiving rules.
+ */
+export function workerPipelinePrefixes(stateDir: string): string[] {
+  try {
+    return readFileSync(workerPipelines(stateDir), 'utf8').split('\n').map(line => line.trim())
+      .filter(line => line !== '' && !line.startsWith('#'))
+  } catch { return [] }
+}
 /** The URL Codeup serves over HTTPS, which workers reach over SSH with the operator's key instead of a credential helper. */
 export const CODEUP_URL = 'https://codeup.aliyun.com/'
 /** The git query proving worker git reads the hooks directory dsh-superagent writes; `verifyEnvironment` runs it and tests answer it. */
@@ -144,17 +158,14 @@ const lookupCommand = (argv: readonly string[], variable: string): string =>
  * may run, and execs the real CLI, so the token reaches that one process and no other.
  * @param organization - the organization the deployment belongs to, which the pipeline lookups name; a worker's environment has none.
  */
-function aliyunShim(dir: string, cli: string, keychain: string, organization: string): string {
+function aliyunShim(stateDir: string, cli: string, keychain: string, organization: string): string {
+  const dir = workerBin(stateDir)
   const branch = SOURCE_BRANCH_FLAG
   const denied = 'dsh-superagent: a worker may not run this yunxiao command; the host runs it, or this phase does not do it'
   // The flags come from the command lists, so calibrating one against a real installation stays a change in `yunxiao.ts`.
+  // A run, a retry and a rerun all name their pipeline, so each is admitted by that pipeline's name; no name, no admission.
   const pipelineIdFlag = YUNXIAO.createPipelineRun(organization, '').at(-2) ?? '--pipeline-id'
-  const jobRunIdFlag = YUNXIAO.retryPipelineJob(organization, '').at(-2) ?? '--job-run-id'
   const lookupPipeline = lookupCommand(YUNXIAO.pipeline(organization, ''), 'pipeline_id')
-  // A task's pipeline is read through the task itself, and through its run when the CLI knows no such task; either failing is
-  // a refusal, so a calibrated installation that needs only one of them still works.
-  const lookupJob = lookupCommand(YUNXIAO.pipelineJobRun(organization, ''), 'job_run_id')
-  const lookupRun = lookupCommand(YUNXIAO.pipelineRun(organization, ''), 'job_run_id')
   return [
     // The token is exported in this shell only, so it reaches the lookups and the `exec` below and no other process.
     tokenScript(undefined, keychain).trim(),
@@ -162,6 +173,7 @@ function aliyunShim(dir: string, cli: string, keychain: string, organization: st
     // must reach the real binary.
     withoutShims(dir),
     `cli=${shellQuote(cli)}`,
+    `pipelines=${shellQuote(workerPipelines(stateDir))}`,
     // Reads one flag's value out of the arguments, in either `--flag value` or `--flag=value` form, and fails when it is absent.
     'argument() {',
     '  wanted=$1; shift',
@@ -176,23 +188,35 @@ function aliyunShim(dir: string, cli: string, keychain: string, organization: st
     '  [ -n "$found" ] || return 1',
     '  printf "%s" "$found"',
     '}',
-    // Reads the pipeline name out of the CLI's JSON without assuming a parser: the `pipelineName` a run carries, else the `name`
-    // inside its `pipeline` object, else the first `name`. A reply without one names no pipeline, which the caller refuses.
+    // Reads the pipeline name out of the CLI's JSON without assuming a parser: `pipelineName`, or the `name` inside a `pipeline`
+    // object (the first pattern finds a nested `pipeline.pipelineName` too). Another `name` may be a run's, so a reply without a
+    // pipeline name names no pipeline, which the caller refuses.
     'pipeline_name() {',
     `  text=$(printf '%s' "$1" | tr '\\n' ' ')`,
     `  match=$(printf '%s' "$text" | grep -o '"pipelineName"[[:space:]]*:[[:space:]]*"[^"]*"' | head -n 1)`,
     `  [ -n "$match" ] || match=$(printf '%s' "$text" | grep -o '"pipeline"[[:space:]]*:[[:space:]]*{[^}]*"name"[[:space:]]*:[[:space:]]*"[^"]*"' | head -n 1)`,
-    `  [ -n "$match" ] || match=$(printf '%s' "$text" | grep -o '"name"[[:space:]]*:[[:space:]]*"[^"]*"' | head -n 1)`,
     '  [ -n "$match" ] || return 1',
     `  name=$(printf '%s' "$match" | sed 's/.*:[[:space:]]*"\\([^"]*\\)"$/\\1/')`,
     '  [ -n "$name" ] || return 1',
     '  printf "%s" "$name"',
     '}',
-    // Only qa- and pre- pipelines are a worker's to run; prod- and prod-pre- start with other letters, so neither prefix matches.
+    // A pipeline is a worker's when its name starts with one of the prefixes the host wrote for the settings, compared without
+    // case; a missing or empty file falls back to the defaults. prod- and prod-pre- match neither, so both stay the host's.
     'admit_pipeline() {',
-    '  case "$1" in',
-    '    qa-*|pre-*) return 0 ;;',
-    '  esac',
+    `  lower=$(printf '%s' "$1" | tr '[:upper:]' '[:lower:]')`,
+    '  named=',
+    '  if [ -r "$pipelines" ]; then',
+    '    while IFS= read -r line || [ -n "$line" ]; do',
+    `      line=$(printf '%s' "$line" | sed 's/^[[:space:]]*//; s/[[:space:]]*$//')`,
+    `      case "$line" in ''|'#'*) continue ;; esac`,
+    '      named=1',
+    `      prefix=$(printf '%s' "$line" | tr '[:upper:]' '[:lower:]')`,
+    `      case "$lower" in "$prefix"*) return 0 ;; esac`,
+    '    done < "$pipelines"',
+    '  fi',
+    '  if [ -z "$named" ]; then',
+    `    case "$lower" in ${DEFAULT_PIPELINE_PREFIXES.map(prefix => `${prefix}*`).join('|')}) return 0 ;; esac`,
+    '  fi',
     `  ${denyPipeline()}`,
     '}',
     // Every call names the devops plugin; another plugin is outside what dsh-superagent configures for workers.
@@ -204,7 +228,9 @@ function aliyunShim(dir: string, cli: string, keychain: string, organization: st
     'shift',
     'case "$command" in',
     `  ${READ_ONLY_GLOBS.join('|')}) ;;`,
-    '  codeup-create-change-request|codeup-update-change-request)',
+    // An update changes only a merge request's title or description, so it names no branch to check.
+    '  codeup-update-change-request) ;;',
+    '  codeup-create-change-request)',
     // A worker delivers a bugfix/ or feat/ branch; a merge request from release or master is the host's business.
     '    branch=',
     '    expect=',
@@ -237,17 +263,10 @@ function aliyunShim(dir: string, cli: string, keychain: string, organization: st
     '      esac',
     '    done',
     '    ;;',
-    '  flow-create-pipeline-run)',
+    '  flow-create-pipeline-run|flow-retry-pipeline-job-run|flow-rerun-pipeline-job-run)',
     // The pipeline's name decides whether a worker may run it, so the shim reads it before the run starts; no name, no run.
     `    pipeline_id=$(argument ${shellQuote(pipelineIdFlag)} "$@") || { ${denyPipeline()}; }`,
     `    json=$("$cli" ${lookupPipeline} 2>/dev/null) || json=`,
-    `    name=$(pipeline_name "$json") || { ${denyPipeline()}; }`,
-    '    admit_pipeline "$name"',
-    '    ;;',
-    '  flow-retry-pipeline-job-run|flow-rerun-pipeline-job-run)',
-    `    job_run_id=$(argument ${shellQuote(jobRunIdFlag)} "$@") || { ${denyPipeline()}; }`,
-    `    json=$("$cli" ${lookupJob} 2>/dev/null) || json=`,
-    `    name=$(pipeline_name "$json") || json=$("$cli" ${lookupRun} 2>/dev/null) || json=`,
     `    name=$(pipeline_name "$json") || { ${denyPipeline()}; }`,
     '    admit_pipeline "$name"',
     '    ;;',
@@ -289,6 +308,38 @@ const forwardHook = (name: string): string => [
   `exec "$directory/${name}" "$@"`,
 ].join('\n')
 
+/**
+ * Rewrites the pipelines a worker may run from the receiving rules, atomically and idempotently, keeping the ownership marker
+ * the file's other writers check; returns false when the file was written by hand, which is never replaced.
+ */
+export async function writeWorkerPipelines(stateDir: string, prefixes: readonly string[]): Promise<boolean> {
+  const file = workerPipelines(stateDir)
+  const text = [MARKER, ...prefixes].join('\n') + '\n'
+  // The forwarding script reads this file on every call, so an unchanged one is left alone rather than replaced under a running worker.
+  if (await readFile(file, 'utf8').catch(() => undefined) === text) return true
+  try { await own(file, text) }
+  catch (error) {
+    // A hand-written file is the operator's; the caller reports that the rules do not reach workers.
+    if (error instanceof SetupError && error.code === 'foreignFile') return false
+    throw error
+  }
+  return true
+}
+
+/**
+ * Names the prefixes a worker may run, unless the file already names some: a write from the settings is the operator's choice and
+ * outlives a restart, while a missing or empty file falls back to the defaults.
+ */
+async function syncPipelines(stateDir: string): Promise<void> {
+  const file = workerPipelines(stateDir)
+  const text = await readFile(file, 'utf8').catch(() => undefined)
+  if (text !== undefined) {
+    if (!await written(file)) throw new SetupError('foreignFile', { file })
+    if (text.split('\n').some(line => line.trim() && !line.trim().startsWith('#'))) return
+  }
+  await writeWorkerPipelines(stateDir, DEFAULT_PIPELINE_PREFIXES)
+}
+
 /** The files of the workers' hooks directory: the push guard, and a forwarder for every hook it hides. */
 function hookFiles(): Map<string, string> {
   const files = new Map<string, string>()
@@ -315,7 +366,7 @@ function gitConfig(deployment: Pick<Deployment, 'stateDir' | 'github' | 'codeup'
   ]
   // GitHub authenticates HTTPS pushes through the agent CLI; Codeup authenticates SSH with the operator's key.
   if (github) lines.push('[credential "https://github.com"]', `\thelper = ${gitQuote(credentialHelper(github.cli))}`,
-    '[url "https://github.com/"]', '\tinsteadOf = git@github.com:', '\tinsteadOf = ssh://git@github.com:')
+    '[url "https://github.com/"]', '\tinsteadOf = git@github.com:', '\tinsteadOf = ssh://git@github.com/')
   if (codeup) {
     lines.push('[url "git@codeup.aliyun.com:"]', `\tinsteadOf = ${CODEUP_URL}`)
     // Codeup workers deliver bugfix/ and feat/ branches, so git must run the guard dsh-superagent writes for those pushes.
@@ -340,7 +391,7 @@ export async function writeEnvironment(deployment: Pick<Deployment, 'stateDir' |
   const shims = new Map<string, string>()
   shims.set('gh', github ? run(dir, github.cli) : fail('gh is unavailable: this installation has no GitHub account.'))
   shims.set('lark-cli', feishu ? run(dir, feishu.cli) : fail('lark-cli is unavailable: this installation has no Feishu bot.'))
-  shims.set('aliyun', codeup ? aliyunShim(dir, codeup.cli, keychain, codeup.organization) : fail('aliyun is unavailable: this installation has no Codeup account.'))
+  shims.set('aliyun', codeup ? aliyunShim(stateDir, codeup.cli, keychain, codeup.organization) : fail('aliyun is unavailable: this installation has no Codeup account.'))
   shims.set('security', fail('security is blocked in this installation; dsh-superagent reads the keychain for the agents.'))
   for (const name of new Set(blockedCommands)) {
     if (WORKER_COMMANDS.includes(name) || name === 'security') continue
@@ -350,6 +401,7 @@ export async function writeEnvironment(deployment: Pick<Deployment, 'stateDir' |
   await own(workerGitConfig(stateDir), gitConfig(deployment))
   // The push guard belongs to Codeup, whose tickets deliver bugfix/ and feat/ branches; GitHub branches follow the prepare command.
   await sync(workerHooks(stateDir), codeup ? hookFiles() : new Map(), 0o755)
+  await syncPipelines(stateDir)
 }
 
 /** Applies environment overrides and prepends worker shims to `process.env.PATH`, returning a restore callback. */

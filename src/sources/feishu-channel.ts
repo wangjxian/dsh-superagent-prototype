@@ -3,8 +3,8 @@ import { z } from 'zod'
 import type { OutboundMessage } from '../core/index.ts'
 import { CliError, type Commands } from '../infra/commands.ts'
 import { checkedImText } from '../infra/text.ts'
-import type { SourceContext } from './host.ts'
-import type { ChannelLink, ChannelLinks } from './kind.ts'
+import { KV } from '../kv.ts'
+import type { ChannelHost, ChannelLink, ChannelLinks } from './kind.ts'
 import { feishuTriggerId } from './feishu-trigger.ts'
 
 /** Feishu or Lark AppLink that opens a chat; used when the message's own link was not delivered with the event. */
@@ -20,12 +20,11 @@ export const feishuDirectLink = (brand: 'feishu' | 'lark', openId: string): stri
 /**
  * The flags that start a message in a person's direct chat. A bot has no thread to reply into before it has written there,
  * so the host addresses the person by open_id instead of a chat id.
- * CALIBRATE: `im +messages-create` and `--receive-id-type` against a real lark-cli; the created message's id is what a
- * reply to the confirmation names, so the answer's shape changes `CreatedMessageSchema` alone.
+ * `im +messages-send --user-id` takes the open_id; the created message's id is what a reply to the confirmation names, so
+ * the answer's shape changes `CreatedMessageSchema` alone.
  */
 const createArgs = (openId: string, text: string, idempotencyKey: string): string[] =>
-  ['im', '+messages-create', '--receive-id', openId, '--receive-id-type', 'open_id', '--markdown', text,
-    '--idempotency-key', idempotencyKey]
+  ['im', '+messages-send', '--user-id', openId, '--markdown', text, '--idempotency-key', idempotencyKey]
 /** The created message's id, which the CLI may report at the top level or under `message`. */
 const CreatedMessageSchema = z.looseObject({ message_id: z.string().optional(),
   message: z.looseObject({ message_id: z.string().optional() }).optional() })
@@ -49,11 +48,17 @@ const gone = (error: unknown): boolean => error instanceof CliError && error.cod
  * Replies in the topic of the target message, or starts a message in a person's direct chat when the address names one.
  * Feishu keeps at most one message per idempotency key (the outgoing message's `message.id`).
  */
-export async function sendFeishu(host: Pick<SourceContext, 'commands'>, message: OutboundMessage): Promise<'sent' | 'gone'> {
+export async function sendFeishu(host: ChannelHost, message: OutboundMessage): Promise<'sent' | 'gone'> {
   const address = message.channel.address
   try {
     if (address.new === 'true' && address.openId) {
-      await createFeishuDirect(host.commands, { openId: address.openId, text: message.text, idempotencyKey: message.id })
+      const created = await createFeishuDirect(host.commands, { openId: address.openId, text: message.text, idempotencyKey: message.id })
+      // A message the host started in a ticket's conversation: the person's answer names this message, so the record lets the
+      // reply reach that ticket as its note.
+      if (created && message.ticketId) {
+        host.state?.set(KV.merge.message(created), { thread: message.channel.thread, ticketId: message.ticketId,
+          at: new Date().toISOString(), kind: 'ticket' })
+      }
       return 'sent'
     }
     const messageId = address.messageId

@@ -5,6 +5,7 @@ import { triggerChange, type Change } from '../../hosting.ts'
 import { targetRelease } from '../../infra/release.ts'
 import { IM_WORDS } from '../../infra/text.ts'
 import { repositoryOf } from '../../sources/codeup-hosting.ts'
+import { currentRules } from '../../sources/yunxiao.ts'
 import type { SourceContext } from '../../sources/host.ts'
 import { readResource, type ResourceHost } from '../resources.ts'
 import type { Store } from '../store.ts'
@@ -58,7 +59,9 @@ function holder(host: ExecutorToolsHost, ticket: Ticket, key: string): string | 
 function claimChange(host: ExecutorToolsHost, ticket: Ticket, change: Change): void {
   const context = host.source
   const { hosting } = context.deployment
-  const claim = hosting.claim({ ticket, change, source: triggerChange(context.triggers.get(ticket.origin.triggerId), change.repository) })
+  const origin = context.triggers.get(ticket.origin.triggerId)
+  const serial = typeof origin?.meta.serial === 'string' && origin.meta.serial ? origin.meta.serial : undefined
+  const claim = hosting.claim({ ticket, change, source: triggerChange(origin, change.repository), serial })
   if ('refused' in claim) throw new Error(claim.refused)
   const thread = hosting.thread(change), key = threadKey(thread)
   const owner = holder(host, ticket, key)
@@ -215,7 +218,9 @@ export function executorTools(host: ExecutorToolsHost, ticket: Ticket): Tool[] {
         const repository = repositoryOf(codeup, named)
         if (!repository) throw new Error(`${named} is not a repository of the Codeup workspace ${codeup.workspace}`)
         // The host computes the target and creates the day's release branch when it is missing: a worker may only push bugfix/ and feat/ branches.
-        const target = await targetRelease({ organization: codeup.organization, repository, caller: host.source.commands })
+        // The receiving rules may name another release pattern, trunk or zone than the team's default.
+        const target = await targetRelease({ organization: codeup.organization, repository, caller: host.source.commands,
+          ...currentRules() ? { release: currentRules()!.file.release } : {} })
         return { repository: repository.id, ...target }
       },
     })] : [],

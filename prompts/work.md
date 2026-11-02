@@ -12,7 +12,7 @@ Immediately after creating or adopting a ticket change request, call orchestrato
 Continue checks and review silently until ready.
 The host can also recover a missing association by uniquely matching the change request's head repository and branch to a live ticket.
 Once the change request is self-reviewed, validated and ready for human review, report its actual URL, source trigger and accurate status; state the user-visible outcome separately from technical evidence.
-Do not wait for approval or merge to report an available reviewed change request.
+Do not wait for approval or merge to report an available reviewed change request, except on Codeup, where a ready report ends the ticket: report progress there, and ready only after the merge and the PRE verification the Codeup skill describes.
 For an incomplete draft report blocked and name what remains.
 Do not leave the question only in summary, the hosting platform or the Session and wait.
 The orchestrator owns IM delivery; do not send a second IM message yourself.

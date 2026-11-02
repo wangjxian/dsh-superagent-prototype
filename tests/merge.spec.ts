@@ -4,8 +4,8 @@ import type { Ticket, Trigger } from '../src/core/index.ts'
 import { CliError, Commands } from '../src/infra/commands.ts'
 import { releaseDay } from '../src/infra/release.ts'
 import { KV } from '../src/kv.ts'
-import { Merges, confirmationText, mergeTargetOf, mergeThread, parseReply, sqlFingerprint, type MergeHost,
-  type SqlAction } from '../src/app/merge.ts'
+import { Merges, confirmationText, mergeTargetOf, mergeThread, parseReply, sqlFingerprint, triageAnswer, workerPipeline,
+  workerPrefixes, type MergeHost, type SqlAction } from '../src/app/merge.ts'
 import type { OutboundMessage } from '../src/core/index.ts'
 import { feishuChannel } from '../src/sources/feishu-trigger.ts'
 import { testCodeup, testDeployment } from './fixtures/deployment.ts'
@@ -21,13 +21,17 @@ const ticket = (overrides: Partial<Ticket> = {}): Ticket => ({
   mandate: { strength: 'explicit', policyVersion: '', basis: { via: 'listed' }, scope: 'proj-1',
     actor: { source: 'yunxiao', id: '62cf7f1d' } },
   channels: [], assignments: [], inputs: [], undelivered: [], createdAt: '', updatedAt: '',
+  // The merge requests the ticket reported, which bind without ending it.
+  follows: [12, 13, 14].map(localId => ({ thread: `yunxiao:mr:repo-1:${localId}`, own: true, ends: false })),
   origin: { triggerId: origin.id, triggerIds: [origin.id] }, ...overrides,
 })
 /** The CLI answers one merge flow reads; a test changes the ones it is about. */
 interface World {
   branches: string[]
-  /** Commits the checked release holds that the base branch does not: zero means it merged back. */
+  /** Commits the checked release holds that the base branch does not: zero means it merged back, once a merge request merged into it. */
   ahead: number
+  /** The target branches of the repository's merged merge requests. */
+  merged?: string[]
   checks: unknown[]
   comments: unknown[]
   change: Record<string, unknown>
@@ -43,17 +47,27 @@ interface World {
 }
 const world = (overrides: Partial<World> = {}): World => ({
   branches: ['master', YESTERDAY, TODAY], ahead: 3, checks: [{ name: 'build', state: 'SUCCESS' }], comments: [],
+  // `sourceCommitSha` stands for the head commit, which the patch sets report; Codeup's own report names none.
   change: { localId: 12, title: '修复登录后偶发白屏', sourceBranch: 'bugfix/261102-login-12', targetBranch: YESTERDAY,
-    sourceCommitSha: 'e0c6a63b7d1f', state: 'OPEN', webUrl: 'https://codeup.aliyun.com/org-1/group/app/change/12',
-    conflictStatus: 'NO_CONFLICT', additions: 35, deletions: 12 }, pipelineName: 'prod-axo-manager-x64', ...overrides })
+    sourceCommitSha: 'e0c6a63b7d1f', status: 'UNDER_REVIEW', detailUrl: 'https://codeup.aliyun.com/org-1/group/app/change/12',
+    webUrl: 'https://codeup.aliyun.com/org-1/group/app', conflictCheckStatus: 'NO_CONFLICT' }, pipelineName: 'prod-axo-manager-x64', ...overrides })
 /** The yunxiao CLI answers a merge flow asks for, by subcommand; a schema call gets the object, a raw call its JSON text. */
 function answer(state: World, argv: readonly string[], parsed: boolean): unknown {
   const json = (value: unknown) => JSON.stringify(value)
   const localId = Number(argv[argv.indexOf('--local-id') + 1] ?? 0)
   switch (argv[1] ?? '') {
-    case 'codeup-list-branches': { const names = state.branches.map(name => ({ name })); return parsed ? { result: names } : json(names) }
+    case 'codeup-list-branches': {
+      const search = argv.includes('--search') ? argv[argv.indexOf('--search') + 1]! : ''
+      const names = state.branches.filter(name => name.includes(search)).map(name => ({ name }))
+      return parsed ? { result: names } : json(names)
+    }
     case 'codeup-get-compare': return parsed ? { aheadBy: state.ahead } : json({ aheadBy: state.ahead })
+    case 'codeup-list-change-requests': return json((state.merged ?? state.branches).map(targetBranch => ({ targetBranch })))
     case 'codeup-get-change-request': return state.changes?.[localId] ?? state.change
+    case 'codeup-list-change-request-patch-sets': {
+      const change = state.changes?.[localId] ?? state.change
+      return [{ patchSetBizId: `ps-${localId}`, relatedMergeItemType: 'MERGE_SOURCE', commitId: change.sourceCommitSha, versionNo: 1 }]
+    }
     case 'codeup-list-change-request-ci-check-list': return { checkList: state.checks }
     case 'codeup-list-merge-request-comments': return { comments: state.comments }
     case 'codeup-merge-change-request':
@@ -68,7 +82,7 @@ function answer(state: World, argv: readonly string[], parsed: boolean): unknown
 const argvOf = (call: readonly unknown[]): readonly string[] =>
   (Array.isArray(call[0]) ? call[0] : call[1] ?? []) as readonly string[]
 /** One merge flow over an in-memory record, with the CLI and Feishu answers it makes. */
-function flow(options: { world?: World; approver?: string } = {}) {
+function flow(options: { world?: World; approver?: string; mergeType?: string; pipelines?: () => string[] } = {}) {
   const state = options.world ?? world()
   const deployment = testDeployment({ github: undefined, codeup: testCodeup() })
   const commands = new Commands(() => deployment, {}, new AbortController().signal)
@@ -93,7 +107,9 @@ function flow(options: { world?: World; approver?: string } = {}) {
   const notes: string[] = []
   let approver = options.approver ?? 'ou_approver'
   const merges = new Merges({ commands, store, outbox: { send: message => { sent.push(message) } },
-    note: (_ticketId, text) => { notes.push(text) }, approver: () => approver })
+    note: (_ticketId, text) => { notes.push(text) }, approver: () => approver,
+    ...options.mergeType === undefined ? {} : { mergeType: () => options.mergeType! },
+    ...options.pipelines === undefined ? {} : { pipelines: options.pipelines } })
   return { state, commands, aliyun, lark, kv, store, sent, notes, merges, tickets,
     setApprover: (value: string) => { approver = value }, ticket: tickets.get('t1')! }
 }
@@ -139,7 +155,7 @@ describe('asking to merge', () => {
     const { merges, lark, kv, ticket } = flow()
     expect(await merges.request('t1', [{ repository: 'repo-1', localId: 12 }])).toMatchObject({ status: 'requested' })
     const create = lark.mock.calls[0]![0] as string[]
-    expect(create.slice(0, 6)).toEqual(['im', '+messages-create', '--receive-id', 'ou_approver', '--receive-id-type', 'open_id'])
+    expect(create.slice(0, 4)).toEqual(['im', '+messages-send', '--user-id', 'ou_approver'])
     expect(create).toContain('--idempotency-key')
     const text = create[create.indexOf('--markdown') + 1]!
     expect(text).toContain('【合并确认】 AXOAXO-6812 登录后偶发白屏')
@@ -161,7 +177,7 @@ describe('asking to merge', () => {
     const closed = flow({ world: world({ change: { ...world().change, state: 'MERGED' } }) })
     expect(await closed.merges.request('t1', [{ repository: 'repo-1', localId: 12 }]))
       .toEqual({ status: 'not-ready', message: 'group/app !12 is merged, so it cannot be merged' })
-    const conflicted = flow({ world: world({ change: { ...world().change, conflictStatus: 'CONFLICTED' } }) })
+    const conflicted = flow({ world: world({ change: { ...world().change, conflictCheckStatus: 'HAS_CONFLICT' } }) })
     expect(await conflicted.merges.request('t1', [{ repository: 'repo-1', localId: 12 }])).toMatchObject({ status: 'not-ready',
       message: expect.stringContaining('conflicts') })
     const failing = flow({ world: world({ checks: [{ name: 'build', state: 'FAILED' }] }) })
@@ -174,6 +190,24 @@ describe('asking to merge', () => {
     // The agent's own reports are not someone's review, and a resolved comment asks for nothing.
     const quiet = flow({ world: world({ comments: [{ content: '<!-- dsh-superagent:agent -->\n由智能体代发' }, { content: '已改', resolved: true }] }) })
     expect(await quiet.merges.request('t1', [{ repository: 'repo-1', localId: 12 }])).toMatchObject({ status: 'requested' })
+  })
+  it('refuses a merge request the ticket did not report, and one that targets another branch than the release', async () => {
+    const stranger = flow()
+    stranger.tickets.set('t1', { ...stranger.ticket, follows: [] })
+    expect(await stranger.merges.request('t1', [{ repository: 'repo-1', localId: 12 }])).toEqual({ status: 'not-ready',
+      message: 'group/app !12 is not a merge request of this ticket; report it with orchestrator_report changes first' })
+    // The confirmation shows the release the merge goes to, so a merge request against master is never put to the approver.
+    const trunk = flow({ world: world({ change: { ...world().change, targetBranch: 'master' } }) })
+    expect(await trunk.merges.request('t1', [{ repository: 'repo-1', localId: 12 }])).toEqual({ status: 'not-ready',
+      message: `group/app !12 targets master, but it must target ${YESTERDAY}; move it there before asking to merge` })
+    for (const run of [stranger, trunk]) expect(run.lark).not.toHaveBeenCalled()
+  })
+  it('asks again for a merge request whose earlier confirmation belonged to a ticket that ended', async () => {
+    const run = flow()
+    await run.merges.request('t1', [{ repository: 'repo-1', localId: 12 }])
+    run.tickets.set('t1', { ...run.ticket, ended: { at: '2026-11-02T10:00:00Z', by: 'executor', outcome: 'completed' } })
+    run.tickets.set('t2', { ...run.ticket, id: 't2' })
+    expect(await run.merges.request('t2', [{ repository: 'repo-1', localId: 12 }])).toMatchObject({ status: 'requested' })
   })
   it('answers for a ticket that is not open, and for a request that names no merge request', async () => {
     const run = flow()
@@ -200,7 +234,8 @@ describe('merging on the approver\'s answer', () => {
     const run = await confirmed()
     expect(await run.merges.onTrigger(approval('同意'))).toBe(true)
     const merge = run.aliyun.mock.calls.map(argvOf).find(argv => argv[1] === 'codeup-merge-change-request')
-    expect(merge).toEqual(['devops', 'codeup-merge-change-request', '--organization-id', 'org-1', '--repository-id', 'repo-1', '--local-id', '12'])
+    expect(merge).toEqual(['devops', 'codeup-merge-change-request', '--organization-id', 'org-1', '--repository-id', 'repo-1', '--local-id', '12',
+      '--merge-type', 'no-fast-forward'])
     expect(run.kv.get(KV.merge.mr('yunxiao:mr:repo-1:12'))).toMatchObject({ state: 'merged', confirmedAt: expect.any(String) })
     expect(run.notes).toEqual(['【合并结果】已合并 group/app !12。请继续 PRE 部署与验证。'])
     expect(run.sent[0]!.text).toBe('已合并 group/app !12，已通知 worker 继续。')
@@ -225,6 +260,35 @@ describe('merging on the approver\'s answer', () => {
     await late.merges.onTrigger(approval('同意'))
     expect(late.aliyun.mock.calls.map(argvOf).some(argv => argv[1] === 'codeup-merge-change-request')).toBe(false)
     expect(late.notes[0]).toContain('has merged back into the base branch')
+  })
+  it('merges with the merge type the receiving rules name, and refuses a target that changed since the confirmation', async () => {
+    const squash = await confirmed({ mergeType: 'squash' })
+    await squash.merges.onTrigger(approval('同意'))
+    const merge = squash.aliyun.mock.calls.map(argvOf).find(argv => argv[1] === 'codeup-merge-change-request')!
+    expect(merge.slice(-2)).toEqual(['--merge-type', 'squash'])
+    const moved = await confirmed()
+    moved.state.change = { ...moved.state.change, targetBranch: 'master' }
+    await moved.merges.onTrigger(approval('同意'))
+    expect(moved.aliyun.mock.calls.map(argvOf).some(argv => argv[1] === 'codeup-merge-change-request')).toBe(false)
+    expect(moved.notes[0]).toContain(`it targets master now, not the confirmed ${YESTERDAY}`)
+  })
+  it('delivers the replacement to the release the approver named, and closes the merge request it replaced once it merged', async () => {
+    const day = TODAY.slice('release/'.length)
+    const run = await confirmed({ world: world({ changes: { 12: world().change,
+      13: { ...world().change, localId: 13, sourceBranch: 'bugfix/261102-login-12-to-release-' + day, targetBranch: TODAY, sourceCommitSha: 'dddd4444' } } }) })
+    await run.merges.onTrigger(approval(`改 ${day}`))
+    expect(run.notes[0]).toContain(`从原分支拉 <原分支>-to-release-${day} 分支`)
+    expect(run.notes[0]).toContain('新 MR 合并后由宿主关闭')
+    // The rule alone would name yesterday's release; the approver's retarget wins for the replacement.
+    expect(await run.merges.request('t1', [{ repository: 'repo-1', localId: 13 }])).toMatchObject({ status: 'requested' })
+    expect(run.kv.get(KV.merge.mr(mergeThread('repo-1', 13)))).toMatchObject({ state: 'waiting', target: TODAY })
+    await run.merges.onTrigger(approval('同意'))
+    const calls = run.aliyun.mock.calls.map(argvOf)
+    expect(calls.find(argv => argv[1] === 'codeup-merge-change-request')).toContain('13')
+    expect(calls.find(argv => argv[1] === 'codeup-close-change-request')).toEqual(['devops', 'codeup-close-change-request',
+      '--organization-id', 'org-1', '--repository-id', 'repo-1', '--local-id', '12'])
+    expect(run.kv.get(KV.merge.mr(mergeThread('repo-1', 12)))).toMatchObject({ state: 'closed' })
+    expect(run.notes.at(-1)).toContain('已关闭被替换的 group/app !12')
   })
   it('moves the delivery to the release the approver names', async () => {
     const run = await confirmed()
@@ -287,7 +351,7 @@ describe('asking to run a pipeline', () => {
     const run = flow()
     expect(await run.merges.requestPipeline('t1', 'pipe-1')).toMatchObject({ status: 'requested' })
     const create = run.lark.mock.calls[0]![0] as string[]
-    expect(create.slice(0, 6)).toEqual(['im', '+messages-create', '--receive-id', 'ou_approver', '--receive-id-type', 'open_id'])
+    expect(create.slice(0, 4)).toEqual(['im', '+messages-send', '--user-id', 'ou_approver'])
     const text = create[create.indexOf('--markdown') + 1]!
     expect(text).toContain('【流水线确认】 AXOAXO-6812 登录后偶发白屏')
     expect(text).toContain('流水线：prod-axo-manager-x64（id pipe-1）')
@@ -473,6 +537,135 @@ describe('running approved statements', () => {
     expect(run.kv.get(KV.sql.approved(sqlFingerprint(first)))).toBeUndefined()
     expect(run.notes[0]).toContain('「改 20261102」——SQL 没有可改的目标 release')
     expect(run.sent[0]!.text).toContain('已按驳回转给 worker')
+  })
+})
+
+/** A triage question the Source asked the approver about one work item, and the reply that answers it. */
+const asked = (run: ReturnType<typeof flow>, workitemId = 'wi-123') => {
+  run.kv.set(KV.merge.message('om_triage'), { thread: '', ticketId: '', at: '2026-11-02T09:00:00Z', kind: 'triage', workitemId })
+  run.kv.set(KV.yunxiao.triage(workitemId), { state: 'asked', messageId: 'om_triage', at: '2026-11-02T09:00:00Z', cycle: 2 })
+}
+const triageReply = (text: string, overrides: Partial<Trigger> = {}): Trigger =>
+  approval(text, { meta: { chatId: 'oc_dm', messageId: 'om_reply', direct: true, parentId: 'om_triage', approval: true }, ...overrides })
+
+describe('answering a triage question', () => {
+  it('starts the work item when the approver says 开工, keeping the repair cycle', async () => {
+    const run = flow()
+    asked(run)
+    expect(await run.merges.onTrigger(triageReply('开工'))).toBe(true)
+    expect(run.kv.get(KV.yunxiao.triage('wi-123'))).toEqual({ state: 'go', messageId: 'om_triage', cycle: 2,
+      at: expect.any(String), answer: '开工' })
+    expect(run.sent[0]!.text).toBe('已开始处理这条工作项。')
+    // Answered: the record still maps the message, but no longer names the work item it asked about.
+    expect(run.kv.get(KV.merge.message('om_triage'))).toEqual({ thread: '', ticketId: '', at: '2026-11-02T09:00:00Z', kind: 'triage' })
+  })
+  it('skips the work item when the approver says 不做', async () => {
+    const run = flow()
+    asked(run)
+    expect(await run.merges.onTrigger(triageReply('不做'))).toBe(true)
+    expect(run.kv.get(KV.yunxiao.triage('wi-123'))).toMatchObject({ state: 'declined', answer: '不做', cycle: 2 })
+    expect(run.sent[0]!.text).toBe('已跳过这条工作项。')
+  })
+  it('starts the work item with the words a 开工 carries', async () => {
+    const run = flow()
+    asked(run)
+    expect(await run.merges.onTrigger(triageReply('开工，另外记得看下日志'))).toBe(true)
+    expect(run.kv.get(KV.yunxiao.triage('wi-123'))).toMatchObject({ state: 'go', answer: '开工，另外记得看下日志' })
+    expect(run.sent[0]!.text).toBe('已把补充信息转给工作项，开始处理。')
+  })
+  it('skips the work item when the approver says it waits', async () => {
+    // Anything that says the work waits, or names what it waits for, is a refusal: starting it would be the worse mistake.
+    for (const text of ['先不处理', '等产品确认', '暂缓']) {
+      const run = flow()
+      asked(run)
+      expect(await run.merges.onTrigger(triageReply(text))).toBe(true)
+      expect(run.kv.get(KV.yunxiao.triage('wi-123'))).toMatchObject({ state: 'declined', answer: text })
+      expect(run.sent[0]!.text).toBe('已跳过这条工作项。')
+    }
+  })
+  it('acts on the approver only, and answers a question once', async () => {
+    const run = flow()
+    asked(run)
+    expect(await run.merges.onTrigger(triageReply('开工', { actor: { source: 'feishu', id: 'ou_someone' } }))).toBe(true)
+    expect(run.kv.get(KV.yunxiao.triage('wi-123'))).toMatchObject({ state: 'asked' })
+    expect(run.sent[0]!.text).toBe('只有配置的审批人可以确认这条请求。')
+    await run.merges.onTrigger(triageReply('开工'))
+    await run.merges.onTrigger(triageReply('不做'))
+    expect(run.kv.get(KV.yunxiao.triage('wi-123'))).toMatchObject({ state: 'go' })
+    expect(run.sent.at(-1)!.text).toBe('这条确认已经处理过了。')
+  })
+  it('starts nothing on the replies that only look like a start', () => {
+    // A person reported these: a refusal, a question, and words that merely contain 开工 or go start nothing.
+    for (const text of ['不可以', '还不能开始', '不行，开始前先问产品', '开始之前先问下产品', 'looks good', '这个 bug 已经有人在 go 了']) {
+      expect(triageAnswer(text)?.state).not.toBe('go')
+    }
+    // A start counts as the reply's opening words, and carries whatever follows as the supplement.
+    expect(triageAnswer('开工，先看登录页')).toEqual({ state: 'go', answer: '开工，先看登录页' })
+    expect(triageAnswer('开工吧')).toEqual({ state: 'go', answer: '开工吧' })
+    // A question is no start, and a refusal wins wherever it sits.
+    expect(triageAnswer('开工吗')).toBeUndefined()
+    expect(triageAnswer('开工，不用等我确认')).toMatchObject({ state: 'declined' })
+    // A refusal anywhere in the reply outranks a start, so a change of mind reads as the refusal it ends on.
+    for (const text of ['开工，不对，先别', '不开工', '别开工', '可以，但先别动数据库']) {
+      expect(triageAnswer(text)).toMatchObject({ state: 'declined' })
+    }
+    expect(triageAnswer('先不')).toMatchObject({ state: 'declined' })
+  })
+  it('answers a bare start as a start, and one with words after it as a supplement', async () => {
+    const plain = flow()
+    asked(plain)
+    await plain.merges.onTrigger(triageReply('开工吧'))
+    expect(plain.kv.get(KV.yunxiao.triage('wi-123'))).toMatchObject({ state: 'go', answer: '开工吧' })
+    expect(plain.sent[0]!.text).toBe('已开始处理这条工作项。')
+    const more = flow()
+    asked(more)
+    await more.merges.onTrigger(triageReply('开工，先看登录页'))
+    expect(more.sent[0]!.text).toBe('已把补充信息转给工作项，开始处理。')
+    // A question starts nothing: the question stays open for a real answer.
+    const asking = flow()
+    asked(asking)
+    await asking.merges.onTrigger(triageReply('开工吗'))
+    expect(asking.kv.get(KV.yunxiao.triage('wi-123'))).toMatchObject({ state: 'asked' })
+  })
+  it('leaves the question open for a reply that decides nothing', async () => {
+    // An empty message, a question of their own, a word we cannot read: none of them starts work on a guess.
+    for (const text of ['   ', '嗯…我想想', '这个需求谁提的？']) {
+      const run = flow()
+      asked(run)
+      expect(await run.merges.onTrigger(triageReply(text))).toBe(true)
+      expect(run.kv.get(KV.yunxiao.triage('wi-123'))).toMatchObject({ state: 'asked' })
+      expect(run.sent[0]!.text).toBe('没看懂这条回复，先没开工；回复「开工」开始，或直接说要补充的信息。')
+    }
+  })
+  it('reads the decisions the team writes, and decides nothing on a message that names neither', () => {
+    for (const text of ['开工', '开始', '可以', 'go', 'OK', '做吧']) expect(triageAnswer(text)).toEqual({ state: 'go', answer: text })
+    for (const text of ['不做', '跳过', '不用', '先不处理', '等产品确认', '暂缓', '待定', '先放着', '先别', '不开工', '别开工']) {
+      expect(triageAnswer(text)).toEqual({ state: 'declined', answer: text })
+    }
+    // A refusal wins when a message says both, and a message that names no decision decides nothing.
+    expect(triageAnswer('不做，跳过')).toMatchObject({ state: 'declined' })
+    expect(triageAnswer('先不处理，等我确认')).toMatchObject({ state: 'declined' })
+    expect(triageAnswer('嗯…我想想')).toBeUndefined()
+    expect(triageAnswer(' 开工 ')).toEqual({ state: 'go', answer: '开工' })
+  })
+})
+
+describe('the pipelines a worker may start itself', () => {
+  it('takes the prefixes the workers read before the receiving rules, which the host supplies', async () => {
+    // A file the workers read names staging-, so the host lets a staging- pipeline through and asks about a qa- one.
+    const staging = flow({ world: world({ pipelineName: 'staging-axo' }), pipelines: () => ['staging-'] })
+    expect(await staging.merges.requestPipeline('t1', 'pipe-1')).toMatchObject({ status: 'not-ready' })
+    const qa = flow({ world: world({ pipelineName: 'qa-axo' }), pipelines: () => ['staging-'] })
+    expect(await qa.merges.requestPipeline('t1', 'pipe-1')).toMatchObject({ status: 'requested' })
+  })
+  it('reads the receiving rules\' prefixes, whatever the case, and keeps the team default without rules', () => {
+    expect(workerPrefixes(undefined)).toEqual(['qa-', 'pre-'])
+    expect(workerPrefixes(['qa-', 'pre-'])).toEqual(['qa-', 'pre-'])
+    expect(workerPrefixes([' QA- ', 'staging-', ''])).toEqual(['QA-', 'staging-'])
+    expect(workerPipeline(undefined, 'qa-axo')).toBe(true)
+    expect(workerPipeline(['staging-'], 'STAGING-axo')).toBe(true)
+    // A pipeline outside the configured prefixes needs the approver, however the default would have read it.
+    expect(workerPipeline(['staging-'], 'qa-axo')).toBe(false)
   })
 })
 

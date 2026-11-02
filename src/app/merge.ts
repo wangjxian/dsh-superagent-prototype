@@ -7,20 +7,21 @@
 import { z } from 'zod'
 import { key, liveTicket, threadKey, type Ticket, type Trigger } from '../core/index.ts'
 import type { CodeupAccount, CodeupRepository } from '../deployment.ts'
-import type { Change } from '../hosting.ts'
 import type { Commands } from '../infra/commands.ts'
 import { targetRelease, type TargetRelease } from '../infra/release.ts'
-import { YUNXIAO } from '../infra/yunxiao.ts'
+import { DEFAULT_MERGE_TYPE, YUNXIAO } from '../infra/yunxiao.ts'
 import { KV } from '../kv.ts'
 import { repositoryOf } from '../sources/codeup-hosting.ts'
 import { createFeishuDirect } from '../sources/feishu-channel.ts'
 import { feishuRepliesTo } from '../sources/feishu-trigger.ts'
-import { isAgentComment } from '../sources/yunxiao-trigger.ts'
+import { mergeChecksOf, readMergeRequest } from '../sources/yunxiao-mr.ts'
+import { isAgentComment, TRIAGE_BARE, TRIAGE_GO, TRIAGE_NO } from '../sources/yunxiao-trigger.ts'
+import { currentRules } from '../sources/yunxiao.ts'
 import type { Outbox } from './outbox.ts'
 import type { Store } from './store.ts'
 
 /** The state of one merge request's approval, as `KV.merge.mr` records it. */
-export type MergeState = 'waiting' | 'confirmed' | 'merging' | 'merged' | 'rejected' | 'retarget'
+export type MergeState = 'waiting' | 'confirmed' | 'merging' | 'merged' | 'rejected' | 'retarget' | 'closed'
 /** One merge request a worker asks to merge, as `orchestrator_report` names it. */
 export interface MergeRequestRef { repository: string; localId: number }
 /** What a merge request's confirmation says about it, which the approver reads before answering. */
@@ -66,6 +67,13 @@ export interface MergeHost {
   readonly note: (ticketId: string, text: string) => void
   /** The approver's Feishu open_id: from the receiving rules, or the last direct message the approver sent. */
   readonly approver: () => string
+  /** The merge type the receiving rules name (`release.mergeType`); empty or absent merges with `DEFAULT_MERGE_TYPE`. */
+  readonly mergeType?: () => string
+  /**
+   * The pipeline prefixes in force, read from the file the workers' forwarding script reads, so a worker never hears one thing
+   * from the script and another from the host. Absent falls back to the receiving rules.
+   */
+  readonly pipelines?: () => string[]
 }
 
 /**
@@ -73,22 +81,37 @@ export interface MergeHost {
  * pipeline, or PRE statements.
  */
 interface ConfirmationRecord {
-  thread: string; ticketId: string; at: string; kind?: 'merge' | 'pipeline' | 'sql'
+  thread: string; ticketId: string; at: string
+  /** The kinds this module answers; a `ticket` record is the host's own, and one of another kind is left alone. */
+  kind?: 'merge' | 'pipeline' | 'sql' | 'triage'
   pipeline?: { id: string; name: string }
+  /** A triage question names the work item it asks about; a ticket's own message names the ticket an answer belongs to. */
+  workitemId?: string
   sql?: readonly SqlStatement[]
 }
 /** A pipeline a worker asks the host to start, as the CLI reports it. */
 export interface PipelineRef { id: string; name: string }
-/** The pipelines a worker may start itself, which therefore never reach the approver. */
-const WORKER_PIPELINE = /^(qa|pre)-/i
+/**
+ * The prefixes of the pipelines a worker may start itself: the receiving rules' `pipelines.allowPrefixes`, or the team's
+ * qa- and pre- convention while no rule file is loaded. A pipeline outside them needs the approver's confirmation.
+ */
+export function workerPrefixes(prefixes: readonly string[] | undefined): string[] {
+  const named = (prefixes ?? []).map(prefix => prefix.trim()).filter(Boolean)
+  return named.length ? named : ['qa-', 'pre-']
+}
+/** Whether a pipeline's name puts it among the ones a worker may start itself, whatever the case either side is written in. */
+export const workerPipeline = (prefixes: readonly string[] | undefined, name: string): boolean =>
+  workerPrefixes(prefixes).some(prefix => name.toLowerCase().startsWith(prefix.toLowerCase()))
 /**
  * The message the approver answers before the host starts a pipeline outside the worker's allowlist: which pipeline, what
  * starting it means, and how to reply. Like the merge confirmation, it is user-facing copy in the team's language.
  */
-export function pipelineConfirmationText(input: { serial?: string; title: string; pipeline: PipelineRef }): string {
+export function pipelineConfirmationText(input: { serial?: string; title: string; pipeline: PipelineRef;
+  prefixes?: readonly string[] }): string {
   const head = ['【流水线确认】', input.serial ?? '', input.title].filter(Boolean).join(' ')
+  const allowed = workerPrefixes(input.prefixes)
   return [head, '', `流水线：${input.pipeline.name}（id ${input.pipeline.id}）`,
-    '这条流水线不在 qa- / pre- 之内，worker 不能自己启动；同意后由宿主启动它，worker 再盯运行和日志。', '',
+    `这条流水线不在 ${allowed.join(' / ')} 之内，worker 不能自己启动；同意后由宿主启动它，worker 再盯运行和日志。`, '',
     '请直接回复本条消息：同意 / 写原因驳回（流水线没有可改的目标 release）。'].join('\n')
 }
 /**
@@ -182,26 +205,38 @@ export function parseReply(text: string): MergeReply {
 }
 
 /**
+ * The words that refuse a triage question, wherever they sit in the reply: a person who says the work waits, or names what it
+ * waits for, decided against starting it now. A message that says both kinds of thing reads as a refusal, because starting
+ * work nobody asked for is the worse mistake.
+ */
+/**
+ * What the approver's answer to a triage question asks: start the work item, or skip it. A refusal counts wherever it sits,
+ * while a start counts only as the reply's opening words, so `还不能开始` and `已经有人在 go 了` start nothing; a reply that
+ * names neither decision is no answer at all, which the caller leaves the question open for. The words travel with a
+ * decision, because everything beyond a bare one is the supplement the question was asked for, which the Source folds into
+ * the trigger the work item starts with.
+ */
+export function triageAnswer(text: string): { state: 'go' | 'declined'; answer: string } | undefined {
+  const clean = text.trim()
+  if (TRIAGE_NO.test(clean)) return { state: 'declined', answer: clean }
+  if (TRIAGE_GO.test(clean)) return { state: 'go', answer: clean }
+  return undefined
+}
+/**
  * Candidate field names of the Codeup reports this module reads; the CLI renders the OpenAPI models, and the exact names are
  * a calibration point of a real installation. Each lookup tries them in order, so a renamed field changes this table alone,
  * and a field a report does not carry only drops the evidence that depends on it.
  */
 const FIELD = {
-  conflict: ['conflictStatus', 'hasConflict', 'conflict', 'conflicts'],
-  additions: ['additions', 'totalAdditions', 'addedLines'],
-  deletions: ['deletions', 'totalDeletions', 'deletedLines'],
-  checkState: ['state', 'status', 'result'],
   commentBody: ['content', 'commentContent', 'body', 'text'],
   commentResolved: ['resolved', 'isResolved'],
   commentState: ['state', 'status', 'resolvedStatus'],
   pipelineName: ['name', 'pipelineName'],
   pipelineId: ['id', 'pipelineId'],
 } as const
-const CHECK_LIST = ['checkList', 'checks', 'ciChecks', 'items', 'list'] as const
 const COMMENT_LIST = ['comments', 'items', 'records', 'list'] as const
 const PASSED_CHECK = /^(success|succeeded|passed|pass|ok|通过)$/i
 const FAILED_CHECK = /^(fail|failed|failure|error|失败)$/i
-const CONFLICT_VALUE = /^(true|yes|conflict|conflicted|冲突)$/i
 const RESOLVED_VALUE = /resolved|closed/i
 
 /** A record of the CLI's answer, or undefined for anything else. */
@@ -239,15 +274,6 @@ function itemsOf(raw: unknown, keys: readonly string[]): unknown[] {
 /** A text field of a report, trimmed; a number reads as its digits. */
 const textOf = (value: unknown): string | undefined =>
   typeof value === 'string' ? value.trim() || undefined : typeof value === 'number' ? String(value) : undefined
-/** A count a report writes as a number or a numeric string. */
-const countOf = (value: unknown): number | undefined => typeof value === 'number' && Number.isFinite(value) ? value
-  : typeof value === 'string' && /^\d+$/.test(value) ? Number(value) : undefined
-/** Whether a merge request reports a conflict; a report that carries no conflict field reads as none. */
-function conflicted(raw: unknown): boolean {
-  const value = pick(modelOf(raw), FIELD.conflict)
-  if (typeof value === 'boolean') return value
-  return typeof value === 'string' && CONFLICT_VALUE.test(value.trim())
-}
 /** The Thread a Codeup merge request lives on, which the work-item Source polls too (`yunxiao:mr:<repository>:<localId>`). */
 export const mergeThread = (repositoryId: string, localId: number): string =>
   threadKey({ source: 'yunxiao', id: `mr:${repositoryId}:${localId}` })
@@ -276,6 +302,14 @@ export class Merges {
   private account(): CodeupAccount | undefined { return this.host.commands.deployment.codeup }
   /** The repository a caller names by id or by group path. */
   private repository(account: CodeupAccount, name: string): CodeupRepository | undefined { return repositoryOf(account, name) }
+  /**
+   * The pipeline prefixes in force: the ones the workers' own file names, so the host and a worker's forwarding script agree,
+   * and the receiving rules only while nothing wrote that file.
+   */
+  private pipelinePrefixes(): readonly string[] | undefined {
+    const written = this.host.pipelines?.() ?? []
+    return written.length ? written : currentRules()?.file.pipelines.allowPrefixes
+  }
 
   /**
    * A worker asks to merge its ticket's merge requests: checks each one, sends the approver one confirmation listing all of
@@ -292,11 +326,15 @@ export class Merges {
     const approver = this.host.approver()
     if (!approver) return { status: 'unconfigured', message: 'No approver is configured: set approver.feishuOpenId in the receiving rules' }
     // One confirmation per merge request at a time: asking again while it waits would send the approver a second message.
-    const waiting = changes.filter(change => this.recordOf(account, change)?.state === 'waiting')
+    // A confirmation whose ticket ended waits on nothing any more.
+    const waiting = changes.filter(change => {
+      const record = this.recordOf(account, change)
+      return record?.state === 'waiting' && !!record.messageId && this.open(store.get(KV.merge.message(record.messageId)))
+    })
     if (waiting.length) return { status: 'already', message: 'The approver already has a confirmation for these merge requests' }
     const prepared: Prepared[] = []
     for (const change of changes) {
-      const result = await this.prepare(account, change)
+      const result = await this.prepare(account, ticket, change)
       if ('problem' in result) return { status: 'not-ready', message: result.problem }
       prepared.push(result)
     }
@@ -331,15 +369,17 @@ export class Merges {
     if (!approver) return { status: 'unconfigured', message: 'No approver is configured: set approver.feishuOpenId in the receiving rules' }
     const pipeline = await this.readPipeline(account, pipelineId)
     if (!pipeline) return { status: 'unknown', message: `Pipeline ${pipelineId} could not be read from the organization` }
-    // The worker starts the qa- and pre- pipelines itself, so only the ones outside that allowlist need the approver.
-    if (WORKER_PIPELINE.test(pipeline.name)) {
-      return { status: 'not-ready', message: `${pipeline.name} is a pipeline the worker may run itself; start it directly` }
+    // The worker starts the pipelines the receiving rules allow it, so only the ones outside that list need the approver.
+    const prefixes = this.pipelinePrefixes()
+    if (workerPipeline(prefixes, pipeline.name)) {
+      return { status: 'not-ready', message: `${pipeline.name} is a pipeline the worker may run itself `
+        + `(prefixes ${workerPrefixes(prefixes).join(', ')}); start it directly` }
     }
     if (this.pendingPipeline(pipeline.id)) {
       return { status: 'already', message: `The approver already has a confirmation for ${pipeline.name}` }
     }
     const serial = this.serialOf(ticket)
-    const text = pipelineConfirmationText({ ...serial ? { serial } : {}, title: ticket.title, pipeline })
+    const text = pipelineConfirmationText({ ...serial ? { serial } : {}, title: ticket.title, pipeline, prefixes })
     const idempotencyKey = key('pipeline-confirm', ticket.id, pipeline.id, pipeline.name)
     const messageId = await createFeishuDirect(commands, { openId: approver, text, idempotencyKey })
     // The message id is what a reply names: without it the confirmation could never be answered (see feishu-channel.ts).
@@ -391,15 +431,20 @@ export class Merges {
     const { store } = this.host
     const messageId = feishuRepliesTo(trigger).find(id => store.get(KV.merge.message(id)) !== undefined)
     if (!messageId) return false
-    const record = store.get(KV.merge.message(messageId))!
-    const ticket = store.tickets.get(record.ticketId)
-    if (!ticket || !liveTicket(ticket)) { this.reply(trigger, '这条确认对应的工单已结束，不再处理。'); return true }
+    const record = store.get(KV.merge.message(messageId))! as ConfirmationRecord
+    // The approver is the only person whose answer any of these messages acts on.
     if (trigger.actor.id !== this.host.approver()) {
       this.reply(trigger, '只有配置的审批人可以确认这条请求。'); return true
     }
+    // A triage question is about a work item no ticket exists for yet, so it is answered before any ticket is looked up.
+    if (record.kind === 'triage') { this.answerTriage(trigger, messageId, record); return true }
+    const ticket = store.tickets.get(record.ticketId)
+    if (!ticket || !liveTicket(ticket)) { this.reply(trigger, '这条确认对应的工单已结束，不再处理。'); return true }
     const reply = parseReply(trigger.text)
     if (record.kind === 'pipeline') { await this.answerPipeline(ticket, trigger, messageId, record, reply); return true }
     if (record.kind === 'sql') { this.answerSql(ticket, trigger, messageId, record, reply); return true }
+    // A record of another kind is the host's: a ticket's own message becomes a note there, never an approval here.
+    if (record.kind !== undefined && record.kind !== 'merge') return false
     const waiting = this.waitingOn(messageId)
     if (!waiting.length) { this.reply(trigger, '这条确认已经处理过了。'); return true }
     if (reply.kind === 'approve') await this.approve(ticket, trigger, waiting)
@@ -417,45 +462,56 @@ export class Merges {
     const account = this.account()
     const repository = account ? this.repository(account, repositoryId) : undefined
     if (!account || !repository) return false
-    const fresh = await targetRelease({ organization: account.organization, repository, caller: this.host.commands })
+    const fresh = await targetRelease({ organization: account.organization, repository, caller: this.host.commands,
+      release: currentRules()?.file.release })
     return fresh.target !== target
   }
 
-  /** Reads one merge request and checks everything a merge needs, or names the first condition it does not meet. */
-  private async prepare(account: CodeupAccount, change: MergeRequestRef): Promise<Preparation> {
+  /**
+   * Reads one merge request and checks everything a merge needs, or names the first condition it does not meet: it is one
+   * the ticket reported, it is open and conflict-free, its CI and reviews are settled, and it targets the release the rule
+   * (or the approver's retarget) names, which is the branch the confirmation shows and the merge goes to.
+   */
+  private async prepare(account: CodeupAccount, ticket: Ticket, change: MergeRequestRef): Promise<Preparation> {
     const repository = this.repository(account, change.repository)
     if (!repository) return { problem: `${change.repository} is not a repository of the Codeup workspace` }
     const { commands } = this.host
     const label = `${repository.path} !${change.localId}`
-    const request: Change = await commands.deployment.hosting.readChange(commands, repository.id, change.localId)
+    const thread = mergeThread(repository.id, change.localId)
+    if (!(ticket.follows ?? []).some(follow => follow.thread === thread)) {
+      return { problem: `${label} is not a merge request of this ticket; report it with orchestrator_report changes first` }
+    }
+    const request = await readMergeRequest(commands, account.organization, { repositoryId: repository.id, localId: change.localId })
     if (request.state !== 'open') return { problem: `${label} is ${request.state}, so it cannot be merged` }
-    // The platform-neutral Change carries no conflict or line counts, and growing it for one platform's fields would make
-    // the contract less neutral: the report is read once more, only for the evidence the confirmation shows.
-    const raw = await commands.aliyun(z.unknown(), YUNXIAO.changeRequest(account.organization, repository.id, change.localId))
-    if (conflicted(raw)) return { problem: `${label} has conflicts; resolve them before asking to merge` }
-    const ci = await this.ciState(account, repository.id, change.localId)
+    if (request.conflict) return { problem: `${label} has conflicts; resolve them before asking to merge` }
+    const ci = await this.ciState(account, repository.id, change.localId, request.patchSet)
     if (ci === 'failed') return { problem: `${label} has a failed CI check` }
     if (ci === 'pending') return { problem: `${label} has a CI check that has not finished` }
     const unresolved = await this.unresolvedComments(account, repository.id, change.localId)
     if (unresolved) return { problem: `${label} has ${unresolved} unresolved review comment(s)` }
-    const target = await targetRelease({ organization: account.organization, repository, caller: commands })
-    return { thread: threadKey(commands.deployment.hosting.thread(request)), repository: repository.path, number: request.number,
-      url: request.url, title: request.title, target: target.target, basis: target.basis,
-      ...this.lineCounts(raw), ci, commit: request.headSha }
+    const requested = this.requestedRelease(ticket, repository.id)
+    const target = await targetRelease({ organization: account.organization, repository, caller: commands, ...requested ? { requested } : {} })
+    if (request.target !== target.target) {
+      return { problem: `${label} targets ${request.target || 'no branch'}, but it must target ${target.target}; move it there before asking to merge` }
+    }
+    return { thread, repository: repository.path, number: change.localId, url: request.url, title: request.title, target: target.target,
+      basis: target.basis, ci, commit: request.head }
   }
 
-  /** The changed-line counts a merge-request report carries, which the confirmation shows as evidence. */
-  private lineCounts(raw: unknown): Pick<ConfirmationChange, 'additions' | 'deletions'> {
-    const model = modelOf(raw)
-    const additions = countOf(pick(model, FIELD.additions))
-    const deletions = countOf(pick(model, FIELD.deletions))
-    return { ...additions === undefined ? {} : { additions }, ...deletions === undefined ? {} : { deletions } }
+  /** The release the approver moved this ticket's delivery to in `repositoryId`, which wins over the computed one. */
+  private requestedRelease(ticket: Ticket, repositoryId: string): string | undefined {
+    for (const follow of ticket.follows ?? []) {
+      const record = this.host.store.get(KV.merge.mr(follow.thread))
+      if (record?.state === 'retarget' && mergeTargetOf(follow.thread)?.repository === repositoryId) return record.target
+    }
+    return undefined
   }
 
-  /** The CI verdict of a merge request's latest commit: passed only when every check passed. */
-  private async ciState(account: CodeupAccount, repositoryId: string, localId: number): Promise<CiState> {
-    const raw = await this.host.commands.aliyun(z.unknown(), YUNXIAO.changeRequestChecks(account.organization, repositoryId, localId))
-    const states = itemsOf(raw, CHECK_LIST).map(check => String(pick(recordOf(check), FIELD.checkState) ?? '').trim()).filter(Boolean)
+  /** The CI verdict of a merge request's latest patch set: passed only when every check passed. */
+  private async ciState(account: CodeupAccount, repositoryId: string, localId: number, patchSet: string | undefined): Promise<CiState> {
+    if (!patchSet) return 'none'
+    const raw = await this.host.commands.aliyun(z.unknown(), YUNXIAO.changeRequestChecks(account.organization, repositoryId, localId, patchSet))
+    const states = mergeChecksOf(raw).map(check => check.status.trim()).filter(Boolean)
     if (!states.length) return 'none'
     if (states.some(state => FAILED_CHECK.test(state))) return 'failed'
     return states.every(state => PASSED_CHECK.test(state)) ? 'passed' : 'pending'
@@ -517,6 +573,7 @@ export class Merges {
     })
     if (!held.length) { this.reply(trigger, '这条确认已经处理过了。'); return }
     const merged: string[] = []
+    const replaced: string[] = []
     for (const [index, item] of held.entries()) {
       const label = this.labelOf(item.thread)
       const problem = await this.mergeOne(account, item).catch((error: unknown) => errorText(error))
@@ -539,9 +596,30 @@ export class Merges {
       }
       store.set(KV.merge.mr(item.thread), { ...record, state: 'merged', confirmedAt: at })
       merged.push(label)
+      replaced.push(...await this.closeReplaced(account, ticket, item.thread))
     }
-    this.note(ticket.id, `【合并结果】已合并 ${merged.join('、')}。请继续 PRE 部署与验证。`)
-    this.reply(trigger, `已合并 ${merged.join('、')}，已通知 worker 继续。`)
+    const closed = replaced.length ? `已关闭被替换的 ${replaced.join('、')}。` : ''
+    this.note(ticket.id, `【合并结果】已合并 ${merged.join('、')}。${closed}请继续 PRE 部署与验证。`)
+    this.reply(trigger, `已合并 ${merged.join('、')}，已通知 worker 继续。${closed}`)
+  }
+
+  /**
+   * Closes the merge requests a retarget replaced in the repository of one that just merged: a worker may not close a merge
+   * request, so the host does it once the replacement is in. One that fails to close stays for a person, as before.
+   */
+  private async closeReplaced(account: CodeupAccount, ticket: Ticket, merged: string): Promise<string[]> {
+    const repository = mergeTargetOf(merged)?.repository
+    const closed: string[] = []
+    for (const follow of ticket.follows ?? []) {
+      const old = mergeTargetOf(follow.thread)
+      const record = this.host.store.get(KV.merge.mr(follow.thread))
+      if (!old || follow.thread === merged || old.repository !== repository || record?.state !== 'retarget') continue
+      try { await this.host.commands.aliyun(YUNXIAO.closeChangeRequest(account.organization, old.repository, old.localId)) }
+      catch { continue }
+      this.host.store.set(KV.merge.mr(follow.thread), { ...record, state: 'closed' })
+      closed.push(this.labelOf(follow.thread))
+    }
+    return closed
   }
 
   /**
@@ -572,6 +650,34 @@ export class Merges {
     this.note(ticket.id, `【流水线】已启动 ${pipeline.name}（${pipeline.id}）。`
       + '按技能说明盯这次运行：读运行和任务日志，失败时修复或重试；PRE 验证通过后报告 ready。')
     this.reply(trigger, `已启动 ${pipeline.name}，已通知 worker。`)
+  }
+
+  /**
+   * Acts on the approver's answer to a triage question: it starts or skips the work item by recording the answer where the
+   * Source reads it, keeping the repair cycle the question was asked for. Words beyond a bare approval travel with it as the
+   * supplement the Source folds into the work item's trigger.
+   */
+  private answerTriage(trigger: Trigger, messageId: string, record: ConfirmationRecord): void {
+    const { store } = this.host
+    const workitemId = record.workitemId ?? ''
+    const asked = workitemId ? store.get(KV.yunxiao.triage(workitemId)) : undefined
+    // The question was answered already, or the work item moved on to another cycle: this reply decides nothing.
+    if (!asked || asked.state !== 'asked') { this.reply(trigger, '这条确认已经处理过了。'); return }
+    const answer = triageAnswer(trigger.text)
+    // A reply that names no decision — a question, an image, a word we cannot read — decides nothing: the question stays
+    // open, so the person can answer again, rather than starting work on a guess.
+    if (!answer) {
+      this.reply(trigger, '没看懂这条回复，先没开工；回复「开工」开始，或直接说要补充的信息。'); return
+    }
+    // The cycle the question was asked for stays as it was: the Source uses it to know whether this cycle asked already.
+    store.set(KV.yunxiao.triage(workitemId), { ...asked, state: answer.state, at: new Date().toISOString(), answer: answer.answer })
+    // Answered: the record still maps the message, but no longer names the work item it asked about.
+    store.set(KV.merge.message(messageId), { thread: record.thread, ticketId: record.ticketId, at: record.at, kind: 'triage' })
+    // A reply that is nothing but the opening words carries no supplement, whatever particle ends it.
+    const opening = TRIAGE_GO.exec(answer.answer)?.[0] ?? ''
+    const bare = TRIAGE_BARE.test(answer.answer) || answer.answer.slice(opening.length).trim() === ''
+    this.reply(trigger, answer.state === 'declined' ? '已跳过这条工作项。'
+      : bare ? '已开始处理这条工作项。' : '已把补充信息转给工作项，开始处理。')
   }
 
   /** Marks a pipeline confirmation answered: its record still maps the message to its ticket, but names no pipeline. */
@@ -616,21 +722,27 @@ export class Merges {
     this.host.store.set(KV.merge.message(messageId), { thread: record.thread, ticketId: record.ticketId, at: record.at, kind: 'sql' })
   }
 
-  /** Whether a confirmation already waits for any of these statement fingerprints. */
+  /** Whether a confirmation message still waits on an open ticket; one whose ticket ended blocks no later request. */
+  private open(record: Pick<ConfirmationRecord, 'ticketId'> | undefined): boolean {
+    const ticket = record ? this.host.store.tickets.get(record.ticketId) : undefined
+    return !!ticket && liveTicket(ticket)
+  }
+
+  /** Whether a confirmation of an open ticket already waits for any of these statement fingerprints. */
   private pendingSql(fingerprints: readonly string[]): boolean {
     const { store } = this.host
     return store.keys(KV.merge.message).some(name => {
       const record = store.get(name)
-      return record?.kind === 'sql' && (record.sql ?? []).some(statement => fingerprints.includes(statement.fingerprint))
+      return record?.kind === 'sql' && this.open(record) && (record.sql ?? []).some(statement => fingerprints.includes(statement.fingerprint))
     })
   }
 
-  /** The confirmation message a pipeline waits on, or undefined while it waits on none. */
+  /** The confirmation message of an open ticket a pipeline waits on, or undefined while it waits on none. */
   private pendingPipeline(pipelineId: string): string | undefined {
     const { store } = this.host
     for (const name of store.keys(KV.merge.message)) {
       const record = store.get(name)
-      if (record?.kind === 'pipeline' && record.pipeline?.id === pipelineId) return name.slice(KV.merge.message.prefix.length)
+      if (record?.kind === 'pipeline' && record.pipeline?.id === pipelineId && this.open(record)) return name.slice(KV.merge.message.prefix.length)
     }
     return undefined
   }
@@ -654,16 +766,17 @@ export class Merges {
     const target = mergeTargetOf(item.thread)
     if (!target) return `its thread ${item.thread} names no merge request`
     const { commands } = this.host
-    // The confirmation is about the commit the approver saw, so a newer one needs a new confirmation.
-    const request = await commands.deployment.hosting.readChange(commands, target.repository, target.localId)
+    // The confirmation is about the commit and the release the approver saw, so a newer commit or another target needs a new one.
+    const request = await readMergeRequest(commands, account.organization, { repositoryId: target.repository, localId: target.localId })
     if (request.state !== 'open') return `it is ${request.state} now`
-    if (request.headSha !== item.commit) {
-      return `its latest commit ${shortCommit(request.headSha)} is not the confirmed ${shortCommit(item.commit)}`
+    if (request.target !== item.target) return `it targets ${request.target || 'no branch'} now, not the confirmed ${item.target}`
+    if (request.head !== item.commit) {
+      return `its latest commit ${shortCommit(request.head)} is not the confirmed ${shortCommit(item.commit)}`
     }
     if (await this.mergedBack(account, target.repository, item.target)) {
       return `${item.target} has merged back into the base branch, so it needs another release`
     }
-    await commands.aliyun(YUNXIAO.mergeChangeRequest(account.organization, target.repository, target.localId))
+    await commands.aliyun(YUNXIAO.mergeChangeRequest(account.organization, target.repository, target.localId, this.host.mergeType?.() || DEFAULT_MERGE_TYPE))
     return undefined
   }
 
@@ -671,7 +784,8 @@ export class Merges {
   private async mergedBack(account: CodeupAccount, repositoryId: string, target: string): Promise<boolean> {
     const repository = this.repository(account, repositoryId)
     if (!repository) return false
-    const checked = await targetRelease({ organization: account.organization, repository, caller: this.host.commands, requested: target })
+    const checked = await targetRelease({ organization: account.organization, repository, caller: this.host.commands,
+      requested: target, release: currentRules()?.file.release })
     return checked.mergedBack
   }
 
@@ -687,7 +801,8 @@ export class Merges {
     const labels = waiting.map(item => this.labelOf(item.thread))
     const day = release.slice('release/'.length)
     this.note(ticket.id, `【合并结果】审批人要求改投 ${release}：请把 ${labels.join('、')} 改投到 ${release}`
-      + `（从 master 拉 …-to-release-${day} 分支、合入 ${release}、提新 MR、关旧 MR），然后重新申请合并。`)
+      + `（从原分支拉 <原分支>-to-release-${day} 分支、合入 ${release} 并解决冲突、提新 MR 并用 orchestrator_report 报告），`
+      + '然后重新申请合并；旧 MR 不用关，新 MR 合并后由宿主关闭。')
     this.reply(trigger, `已通知 worker 把 ${labels.join('、')} 改投到 ${release}，改好后会重新请你确认。`)
   }
 

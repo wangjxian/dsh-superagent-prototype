@@ -447,14 +447,15 @@ it('follows a reported merge request for context where a change does not end its
   const codeup = testCodeup()
   const deployment = testDeployment({ github: undefined, codeup, repository: '' })
   const merge = { localId: 7, title: 'Fix the regression', sourceBranch: 'bugfix/261102-fix-7', targetBranch: 'release/20261101',
-    state: 'OPEN', webUrl: 'https://codeup.aliyun.com/org-1/group/app/change/7', author: { id: 'user-1' } }
+    status: 'UNDER_REVIEW', detailUrl: 'https://codeup.aliyun.com/org-1/group/app/change/7', author: { userId: 'user-1', id: 881811 } }
+  const patchSets = [{ patchSetBizId: 'ps-1', relatedMergeItemType: 'MERGE_SOURCE', commitId: 'a'.repeat(40), versionNo: 1 }]
   const calls: string[][] = []
   const commands = { withSignal: () => commands, aliyun: async (first: unknown, second?: readonly string[]) => {
     const argv = second ?? first as readonly string[]
     calls.push([...argv])
     // The typed overload hands back the record the CLI printed, which the caller validates; the plain one hands back its text.
-    if (second) return merge
-    if (argv[1] === 'codeup-list-branches') return JSON.stringify({ result: [{ name: 'master' }, { name: 'release/20261101' }] })
+    if (second) return argv[1] === 'codeup-list-change-request-patch-sets' ? patchSets : merge
+    if (argv[1] === 'codeup-list-branches') return JSON.stringify({ result: [{ name: 'release/20261101' }] })
     if (argv[1] === 'codeup-get-compare') return '{"aheadBy":2}'
     throw new Error(`unexpected yunxiao call: ${argv.join(' ')}`)
   } } as unknown as Commands
@@ -484,7 +485,7 @@ it('follows a reported merge request for context where a change does not end its
   // A Codeup change binds its Thread for its messages only: the ticket ends with its own ready report, not the merge.
   expect(seen.bound).toEqual([{ key: 'yunxiao:mr:repo-1:7', own: true, ends: false }])
   expect(seen.followed).toEqual([])
-  expect(seen.patched).toEqual([{ key: 'yunxiao:mr:repo-1:7', number: 7, isPr: true, url: merge.webUrl, prAuthor: 'user-1' }])
+  expect(seen.patched).toEqual([{ key: 'yunxiao:mr:repo-1:7', number: 7, isPr: true, url: merge.detailUrl, prAuthor: 'user-1' }])
   expect(seen.reports.at(-1)).toMatchObject({ state: 'progress', summary: 'Opened the merge request.' })
   // The target release is computed on demand: the previous release until it merges back, and the repository as Codeup names it.
   expect(await run('orchestrator_codeup_target', { repository: 'group/app' })).toEqual({ repository: 'repo-1', target: 'release/20261101',

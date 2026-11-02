@@ -6,8 +6,10 @@
 import { z } from 'zod'
 import { key, type ChannelRef, type ThreadRef, type Trigger } from '../core/index.ts'
 import { KV } from '../kv.ts'
-import { CliError } from '../infra/commands.ts'
+import { CliError, type Commands } from '../infra/commands.ts'
+import { releaseBranchDay, targetRelease, type TargetRelease } from '../infra/release.ts'
 import { YUNXIAO } from '../infra/yunxiao.ts'
+import { repositoryOf } from './codeup-hosting.ts'
 import type { SourceContext } from './host.ts'
 import type { YunxiaoFile } from './yunxiao-config.ts'
 import { isAgentComment, SOURCE } from './yunxiao-trigger.ts'
@@ -15,23 +17,31 @@ import { richText } from './yunxiao-text.ts'
 
 /**
  * What polling merge requests needs of a Source's context: the CLI that reads Codeup, its own per-merge-request records, the
- * open tickets whose `follows` name the merge requests, and the Engine. A full `SourceContext` is one, so the work-item
- * Source passes its own context unchanged.
+ * open tickets whose `follows` name the merge requests, the Codeup account whose repositories the release rule reads, and the
+ * Engine. A full `SourceContext` is one, so the work-item Source passes its own context unchanged.
  */
-export type MergeContext = Pick<SourceContext, 'commands' | 'state' | 'tickets' | 'receive'>
+export type MergeContext = Pick<SourceContext, 'commands' | 'state' | 'tickets' | 'receive' | 'deployment'>
 
 /**
  * What one polling round hands the merge-request poller: when the round started (the observation time of a Trigger the
- * response does not time), the round's stop signal, and the reads that failed. A failure is one merge request's step, not the
- * round's: the caller reports them beside its own, and the merge requests it names are read again next round.
+ * response does not time), the round's stop signal, the reads that failed, and the release target each repository was computed
+ * to deliver to. A failure is one merge request's step, not the round's: the caller reports them beside its own, and the merge
+ * requests it names are read again next round.
  */
 export interface MergeRound {
   started: string
   signal?: AbortSignal | undefined
   failures: string[]
+  /**
+   * The release target of each repository, computed once for the round: `targetRelease` reads a branch list, a compare and the
+   * merged merge requests, and a round may hold several merge requests of one repository. A failed computation is kept here
+   * too, so the rest of the repository's merge requests do not repeat the read that failed.
+   */
+  targets: Map<string, TargetRelease | Error>
 }
 /** A round that has failed nothing yet, which the polling loop of the Source builds before it reads anything. */
-export const newMergeRound = (started: string, signal?: AbortSignal): MergeRound => ({ started, signal, failures: [] })
+export const newMergeRound = (started: string, signal?: AbortSignal): MergeRound =>
+  ({ started, signal, failures: [], targets: new Map() })
 
 /** One merge request's identity: the repository it lives in and the local id that repository numbers it by. */
 export interface MergeRequestRef { repositoryId: string; localId: number }
@@ -81,10 +91,10 @@ function stringOf(value: unknown): string | undefined {
   if (typeof value === 'string') return value.trim() || undefined
   return typeof value === 'number' && Number.isFinite(value) ? String(value) : undefined
 }
-/** A person or project field may be an object or a bare id. */
+/** A person field may be an object or a bare id; Codeup's `userId` is the account id, and its numeric `id` is not. */
 function idOf(value: unknown): string | undefined {
   const record = recordOf(value)
-  return record ? stringOf(first(record, ['id', 'identifier', 'userId', 'staffId'])) : stringOf(value)
+  return record ? stringOf(first(record, ['userId', 'id', 'identifier', 'staffId'])) : stringOf(value)
 }
 /**
  * Reads a timestamp the CLI prints as epoch milliseconds or seconds, as a number or a numeric string, or as a date string;
@@ -150,33 +160,48 @@ const FIELD = {
   head: ['sourceCommitSha', 'sourceCommitHash', 'headSha', 'commitSha'],
   conflict: ['conflictCheckStatus', 'conflictStatus', 'mergeConflictStatus', 'hasConflict', 'conflict'],
   title: ['title', 'subject'],
-  url: ['webUrl', 'detailUrl', 'url'],
+  // `detailUrl` is the merge request's page; Codeup's `webUrl` is its repository's.
+  url: ['detailUrl', 'url'],
   target: ['targetBranch', 'baseBranch'],
+  source: ['sourceBranch', 'headBranch'],
+  author: ['author', 'creator'],
+  created: ['createdAt', 'createTime', 'gmtCreate'],
+  workItems: ['workItemIds', 'workitemIds'],
 } as const
 /** Statuses Codeup reports a merged or a closed merge request with; any other status reads as open, as Codeup adds states. */
 const MERGED = /^(?:merged|accepted)\b/i
 const CLOSED = /^(?:closed|declined|rejected|canceled|cancelled)\b/i
-/** A conflict check result that means the merge request does not merge as it stands. */
+/** A conflict check result that means the merge request does not merge as it stands; Codeup answers `NO_CONFLICT` otherwise. */
 const CONFLICTED = /fail|conflict/i
+const NO_CONFLICT = /^no[_ -]?conflicts?$/i
 
 /** What one read of `codeup-get-change-request` says: the state the merge request is in, and what its ticket needs to know. */
 export interface MergeRequestState {
   state: 'open' | 'merged' | 'closed'
   /** The commit the merge request would merge; a different one is a new commit to review. Empty for a close that names none. */
   head: string
+  /** The latest source patch set, whose id the CI checks are read by; `readMergeRequest` fills it for an open merge request. */
+  patchSet?: string
+  /** The account id that opened it. */
+  author: string
   /** True while Codeup reports the merge request as conflicting with its target branch. */
   conflict: boolean
   title: string
   url: string
   target: string
+  /** The branch the merge request delivers. */
+  source: string
   /** When it merged or closed, for the ticket's close record; absent when the response times neither. */
   endedAt?: string
+  createdAt?: string
+  /** The work items the merge request is associated with. */
+  workItemIds?: string[]
 }
 /**
- * Normalizes one merge request of `codeup-get-change-request`.
- * `state` is the field the Source cannot work without, so a response lacking it raises rather than reading as open; an open
- * merge request without its source commit raises too, because a new commit is half of what polling it is for. A merged or
- * closed one may name no commit: its close is the whole news.
+ * Normalizes one merge request of `codeup-get-change-request`, which is the one reading of that report: the poller, the code
+ * hosting contract and the merge approval all go through it, so they agree on its state, conflict and commit.
+ * `state` is the field the Source cannot work without, so a response lacking it raises rather than reading as open. Codeup's
+ * report names no source commit, which `readMergeRequest` reads from the patch sets.
  */
 export function mergeRequestOf(raw: unknown, ref: MergeRequestRef): MergeRequestState {
   const item = unwrap(raw, ['changeRequest', 'mergeRequest', 'request', 'item'])
@@ -187,14 +212,46 @@ export function mergeRequestOf(raw: unknown, ref: MergeRequestRef): MergeRequest
   const closedAt = timeOf(first(item, FIELD.closedAt))
   const state = mergedAt || MERGED.test(status) ? 'merged' : CLOSED.test(status) ? 'closed' : 'open'
   const head = stringOf(first(item, FIELD.head)) ?? ''
-  if (state === 'open' && !head) {
-    throw new Error(`The yunxiao ${labelOf(ref)} names no source commit; a new commit could not be told from the last one`)
-  }
   const conflictField = first(item, FIELD.conflict)
-  const conflict = typeof conflictField === 'boolean' ? conflictField : CONFLICTED.test(stringOf(conflictField) ?? '')
+  const conflictText = stringOf(conflictField) ?? ''
+  const conflict = typeof conflictField === 'boolean' ? conflictField : CONFLICTED.test(conflictText) && !NO_CONFLICT.test(conflictText)
   const endedAt = mergedAt ?? closedAt
-  return { state, head, conflict, title: stringOf(first(item, FIELD.title)) ?? '', url: stringOf(first(item, FIELD.url)) ?? '',
-    target: stringOf(first(item, FIELD.target)) ?? '', ...endedAt ? { endedAt } : {} }
+  const createdAt = timeOf(first(item, FIELD.created))
+  const workItems = first(item, FIELD.workItems)
+  const workItemIds = (Array.isArray(workItems) ? workItems : typeof workItems === 'string' ? workItems.split(',') : [])
+    .map(stringOf).filter((id): id is string => !!id)
+  return { state, head, conflict, author: idOf(first(item, FIELD.author)) ?? '', title: stringOf(first(item, FIELD.title)) ?? '',
+    url: stringOf(first(item, FIELD.url)) ?? '', target: stringOf(first(item, FIELD.target)) ?? '',
+    source: stringOf(first(item, FIELD.source)) ?? '', ...endedAt ? { endedAt } : {},
+    ...createdAt ? { createdAt } : {}, ...workItemIds.length ? { workItemIds } : {} }
+}
+const PATCH_SET_LIST = ['patchSets', 'items', 'list'] as const
+/**
+ * The latest source patch set of a `codeup-list-change-request-patch-sets` report: its id, which the CI checks are read by,
+ * and its commit, the head of the merge request. Target patch sets name the target branch and are skipped.
+ */
+export function latestPatchSet(raw: unknown): { id: string; commit: string } | undefined {
+  const sets = listOf(raw, PATCH_SET_LIST, 'merge request patch set list').flatMap(value => {
+    const record = recordOf(value)
+    const id = stringOf(first(record, ['patchSetBizId', 'patchSetId', 'id']))
+    const commit = stringOf(first(record, ['commitId', 'sha', 'commitSha']))
+    const kind = stringOf(first(record, ['relatedMergeItemType', 'type'])) ?? 'MERGE_SOURCE'
+    return id && commit && kind !== 'MERGE_TARGET' ? [{ id, commit, version: Number(first(record, ['versionNo', 'version'])) || 0 }] : []
+  })
+  const latest = sets.reduce<(typeof sets)[number] | undefined>((best, set) => !best || set.version >= best.version ? set : best, undefined)
+  return latest ? { id: latest.id, commit: latest.commit } : undefined
+}
+/**
+ * Reads one merge request with its latest source patch set, which names the head commit and the CI checks' patch set.
+ * An open merge request without one raises, because a new commit is half of what polling it is for; a merged or closed one
+ * may name none: its close is the whole news.
+ */
+export async function readMergeRequest(commands: Pick<Commands, 'aliyun'>, organization: string, ref: MergeRequestRef): Promise<MergeRequestState> {
+  const change = mergeRequestOf(await commands.aliyun(z.unknown(), YUNXIAO.changeRequest(organization, ref.repositoryId, ref.localId)), ref)
+  if (change.state !== 'open') return change
+  const latest = latestPatchSet(await commands.aliyun(z.unknown(), YUNXIAO.patchSets(organization, ref.repositoryId, ref.localId)))
+  if (!latest) throw new Error(`The yunxiao ${labelOf(ref)} names no source commit; a new commit could not be told from the last one`)
+  return { ...change, head: latest.commit, patchSet: latest.id }
 }
 
 /**
@@ -203,13 +260,13 @@ export function mergeRequestOf(raw: unknown, ref: MergeRequestRef): MergeRequest
  * table; a real installation that names them differently changes these two tables and the two status patterns below.
  */
 const COMMENT_FIELD = {
-  id: ['commentBizId', 'commentId', 'id'],
+  id: ['comment_biz_id', 'commentBizId', 'commentId', 'id'],
   body: ['content', 'commentContent', 'body', 'text'],
   author: ['author', 'creator', 'user', 'createdBy'],
-  created: ['commentTime', 'gmtCreate', 'createTime', 'createdAt'],
-  modified: ['gmtModified', 'modifyTime', 'updatedAt'],
+  created: ['comment_time', 'commentTime', 'gmtCreate', 'createTime', 'createdAt'],
+  modified: ['last_edit_time', 'gmtModified', 'modifyTime', 'updatedAt'],
   url: ['commentUrl', 'url', 'htmlUrl'],
-  parent: ['parentCommentBizId', 'parentCommentId', 'replyToCommentId'],
+  parent: ['parent_comment_biz_id', 'parentCommentBizId', 'parentCommentId', 'replyToCommentId'],
 } as const
 const CHECK_FIELD = {
   name: ['name', 'checkName', 'pipelineName', 'jobName', 'displayName', 'title'],
@@ -218,6 +275,8 @@ const CHECK_FIELD = {
 } as const
 const COMMENT_LIST = ['comments', 'commentList', 'items', 'records', 'list'] as const
 const CHECK_LIST = ['checkList', 'checks', 'ciChecks', 'items', 'records', 'list'] as const
+/** The lists Codeup's CI report holds its checks in, all of which count: checks, check runs and commit statuses. */
+const CODEUP_CHECK_LISTS = ['check_list', 'check_runs', 'commit_statuses'] as const
 /** Whether a user object declares itself a bot or a system account; yunxiao writes people as ordinary accounts. */
 function isBotUser(user: Record<string, unknown> | undefined): boolean {
   const kind = stringOf(first(user, ['userType', 'type', 'accountType', 'userKind', 'identityType']))
@@ -256,15 +315,21 @@ export function mergeCommentOf(raw: unknown): MergeRequestComment {
     // The marker survives in the raw body even when the Markdown conversion drops the HTML comment that carries it.
     ...(typeof rawBody === 'string' && isAgentComment(rawBody)) || isAgentComment(body) ? { agent: true as const } : {} }
 }
-/** The comments of a `codeup-list-merge-request-comments` response, in the order the CLI printed them. */
+/** The comments of a `codeup-list-merge-request-comments` response, each followed by the replies Codeup nests under it. */
 export const mergeCommentsOf = (raw: unknown): MergeRequestComment[] =>
-  listOf(raw, COMMENT_LIST, 'merge request comment list').map(mergeCommentOf)
+  listOf(raw, COMMENT_LIST, 'merge request comment list').flatMap(function flatten(value: unknown): unknown[] {
+    const replies = recordOf(value)?.child_comments_list
+    return [value, ...Array.isArray(replies) ? replies.flatMap(flatten) : []]
+  }).map(mergeCommentOf)
 
 /** One CI check of a merge request's latest commit. */
 export interface MergeCheck { name: string; status: string; url?: string }
 /** The CI checks of a `codeup-list-change-request-ci-check-list` response, in the order the CLI printed them. */
 export function mergeChecksOf(raw: unknown): MergeCheck[] {
-  return listOf(raw, CHECK_LIST, 'merge request CI check list').map((value, index) => {
+  const report = recordOf(raw)
+  const codeup = report && CODEUP_CHECK_LISTS.some(name => name in report)
+    ? CODEUP_CHECK_LISTS.flatMap(name => { const list = report[name]; return Array.isArray(list) ? list : [] }) : undefined
+  return (codeup ?? listOf(raw, CHECK_LIST, 'merge request CI check list')).map((value, index) => {
     const record = recordOf(value)
     const name = stringOf(first(record, CHECK_FIELD.name))
     // A check without a name or a status cannot be counted or told apart from the last round's, so the step fails loudly
@@ -336,6 +401,31 @@ export function mrChangeTrigger(ref: MergeRequestRef, change: MergeRequestState,
       target: change.target } }
 }
 /**
+ * Builds the Trigger that tells the ticket its merge request must move to another release: the branch it targets is no longer
+ * the one the release rule computes, because the previous day's release has merged back or the delivery belongs to a later one.
+ * The worker moves the work itself — it cuts `<source>-to-release-<day>`, merges the new target in, opens a new merge request
+ * and closes the old one — so this is an instruction on the merge request's Thread, never a merge approval state.
+ *
+ * The ID names the merge request and the release to move to, so however many rounds read the same superseded target, the
+ * Engine hands the worker one instruction; a further move of the target is a new Trigger.
+ * @param day - the release day of `target.target`, which the rules' branch pattern names the new branch after.
+ */
+export function mrRetargetTrigger(ref: MergeRequestRef, change: MergeRequestState, target: TargetRelease, day: string, at: string): Trigger {
+  const title = change.title ? ` "${change.title}"` : ''
+  const branch = change.source || 'the source branch'
+  const superseded = target.previous === change.target && target.mergedBack
+    ? `${change.target} has merged back into ${target.base}`
+    : `${change.target} is no longer the release this repository delivers to`
+  const lines = [
+    `Merge request !${ref.localId}${title} in ${ref.repositoryId} targets ${change.target}: ${superseded}, so the delivery now belongs to ${target.target}.`,
+    `From ${branch}, create ${branch}-to-release-${day}, merge ${target.target} into it, open a new merge request to ${target.target}, close !${ref.localId}, then ask to merge again.`,
+  ]
+  return { id: key('yunxiao-mr-retarget', mergeRequestKey(ref), target.target), source: SOURCE,
+    threads: [mergeRequestThread(ref.repositoryId, ref.localId)], actor: { source: SOURCE, id: '' }, human: false, at,
+    text: lines.join('\n'), channel: mergeRequestChannel(ref), ...change.url ? { url: change.url } : {},
+    meta: { mrChange: 'retarget', repository: ref.repositoryId, localId: ref.localId, from: change.target, to: target.target } }
+}
+/**
  * Builds the Trigger for a change in the merge request's CI results. `revision` counts the results reported so far, so each
  * one has its own Trigger ID and a repeated round with the same fingerprint stays quiet.
  */
@@ -363,19 +453,18 @@ async function step(round: MergeRound, threadKey: string, what: string, work: ()
 
 /**
  * Polls the merge requests open tickets follow: each one's state (a merge or a close closes its Thread), then a new commit or
- * a conflict, then its comments, then its CI checks. Every merge request and every step of one fails on its own, so one
- * unreadable merge request neither hides another's change nor loses the record of what was already read.
+ * a conflict, then whether the release it targets has been superseded, then its comments, then its CI checks. Every merge
+ * request and every step of one fails on its own, so one unreadable merge request neither hides another's change nor loses the
+ * record of what was already read.
  *
  * A merge request whose close a ticket already recorded is not read again: the ticket keeps the Thread to answer messages,
  * while the merge or close itself is a fact no later round changes. One the account can no longer read at all closes its
  * Thread and is recorded as gone, so a deleted merge request cannot fail every round of the Source for the rest of its life.
  */
 export async function pollMergeRequests(ctx: MergeContext, file: YunxiaoFile, round: MergeRound): Promise<void> {
-  // Codeup reads run in the organization of the receiving-rule file, as every other read of this Source does.
-  const organization = file.organization
   for (const ref of followedMergeRequests(ctx)) {
     if (round.signal?.aborted) return
-    await pollMergeRequest(ctx, organization, ref, round)
+    await pollMergeRequest(ctx, file, ref, round)
   }
 }
 /** The merge requests open tickets follow, each once, in the order the tickets are read. */
@@ -419,11 +508,13 @@ async function closeGone(ctx: MergeContext, thread: ThreadRef, threadKey: string
   })
 }
 /** Reads and acts on one merge request; without its state nothing else about it can be read, so the record stays put. */
-async function pollMergeRequest(ctx: MergeContext, organization: string, ref: MergeRequestRef, round: MergeRound): Promise<void> {
+async function pollMergeRequest(ctx: MergeContext, file: YunxiaoFile, ref: MergeRequestRef, round: MergeRound): Promise<void> {
   const thread = mergeRequestThread(ref.repositoryId, ref.localId)
   const threadKey = mergeRequestKey(ref)
+  // Codeup reads run in the organization of the receiving-rule file, as every other read of this Source does.
+  const organization = file.organization
   let change: MergeRequestState
-  try { change = mergeRequestOf(await readJson(ctx, YUNXIAO.changeRequest(organization, ref.repositoryId, ref.localId), round), ref) }
+  try { change = await readMergeRequest(ctx.commands.withSignal(round.signal), organization, ref) }
   catch (error) {
     if (round.signal?.aborted) return
     // A merge request the account can no longer read at all is gone rather than unreadable: its Thread closes, and closing it
@@ -440,6 +531,7 @@ async function pollMergeRequest(ctx: MergeContext, organization: string, ref: Me
     return
   }
   await step(round, threadKey, 'change', () => pollChange(ctx, ref, change, round))
+  await step(round, threadKey, 'retarget', () => pollRetarget(ctx, file, ref, change, round))
   await step(round, threadKey, 'comments', () => pollComments(ctx, organization, ref, round))
   await step(round, threadKey, 'CI', () => pollChecks(ctx, organization, ref, change, round))
 }
@@ -456,6 +548,72 @@ async function pollChange(ctx: MergeContext, ref: MergeRequestRef, change: Merge
   // as seen. A conflict that stays is read again every round, and its Trigger ID makes that read a duplicate.
   ctx.state.set(KV.yunxiao.mr(threadKey), { head: change.head, fingerprint: previous?.fingerprint ?? '',
     commentAt: previous?.commentAt ?? '', revision: previous?.revision ?? 0 })
+}
+/**
+ * Tells the ticket when the release its merge request targets has been superseded, so the worker moves the delivery before a
+ * person is asked to merge it. Only a merge request that targets a release branch of the rules' pattern can be re-targeted: a
+ * delivery to the trunk or to a feature branch is not the release rule's business. An approver's own move wins over the rule
+ * (see `approverMoved`), so the worker is never asked to undo what a person decided.
+ */
+async function pollRetarget(ctx: MergeContext, file: YunxiaoFile, ref: MergeRequestRef, change: MergeRequestState, round: MergeRound): Promise<void> {
+  // A delivery to the trunk or to a feature branch is not the release rule's business: only a release branch can be moved.
+  if (!releaseBranchDay(change.target, file.release)) return
+  if (approverMoved(ctx, ref, mergeRequestKey(ref))) return
+  const target = await releaseTargetOf(ctx, file, ref, round)
+  // The computed target is the release this delivery belongs to; while the merge request already targets it, nothing moved.
+  if (!target || target.target === change.target) return
+  // The rules name a release branch after its day, which the new branch of the move carries too.
+  const day = releaseBranchDay(target.target, file.release)
+  if (!day) return
+  await ctx.receive(mrRetargetTrigger(ref, change, target, day, round.started))
+}
+/**
+ * Whether the approver has already decided where this delivery goes. A merge record in the `retarget` state names the release
+ * the approver moved the ticket's delivery to, and that decision wins over the release rule until the ticket ends: the merge
+ * request it was made about waits for the worker's replacement, and the replacement the worker opens in the same repository
+ * must not be asked to move back. The records are the ones merge.ts writes, read from the Threads a ticket follows.
+ */
+function approverMoved(ctx: MergeContext, ref: MergeRequestRef, threadKey: string): boolean {
+  const moved = (thread: string): boolean => ctx.state.get(KV.merge.mr(thread))?.state === 'retarget'
+  // The merge request the approval was about carries the record itself, so it is never asked to move a second time.
+  if (moved(threadKey)) return true
+  for (const ticket of ctx.tickets.open()) {
+    if (!(ticket.follows ?? []).some(follow => follow.thread === threadKey)) continue
+    // One decision covers the ticket's merge requests in this repository: the one the approver answered about, and the one the
+    // worker opens to the release the approver named.
+    for (const follow of ticket.follows ?? []) {
+      if (parseMergeThread(follow.thread)?.repositoryId === ref.repositoryId && moved(follow.thread)) return true
+    }
+  }
+  return false
+}
+/**
+ * The release target of the merge request's repository in this round, computed at most once: `targetRelease` reads the branch
+ * list, a compare and the merged merge requests, and one round may hold several merge requests of a repository. A computation
+ * that failed is recorded against the repository once and remembered, so the rest of the round does not repeat it and the other
+ * merge requests are still read.
+ *
+ * Polling only asks where a delivery would go, so it never creates the day's release: `create: false` makes a missing branch
+ * read as the target without cutting it, which the merge that needs the branch does instead.
+ */
+async function releaseTargetOf(ctx: MergeContext, file: YunxiaoFile, ref: MergeRequestRef, round: MergeRound): Promise<TargetRelease | undefined> {
+  const known = round.targets.get(ref.repositoryId)
+  if (known instanceof Error) return undefined
+  if (known) return known
+  try {
+    const account = ctx.deployment.codeup
+    if (!account) throw new Error('The merge request poller needs the Codeup account to compute a release target')
+    const repository = repositoryOf(account, ref.repositoryId)
+    if (!repository) throw new Error(`${ref.repositoryId} is not a repository of the Codeup workspace ${account.workspace}`)
+    const target = await targetRelease({ organization: file.organization, repository, caller: ctx.commands.withSignal(round.signal),
+      release: file.release, create: false })
+    round.targets.set(ref.repositoryId, target)
+    return target
+  } catch (error) {
+    round.targets.set(ref.repositoryId, error instanceof Error ? error : new Error(String(error)))
+    if (!round.signal?.aborted) round.failures.push(`${ref.repositoryId} release target: ${messageOf(error)}`)
+    return undefined
+  }
 }
 /**
  * Takes in the merge request's comments added since the last read. The agent's own comments are marked and never become
@@ -485,7 +643,8 @@ async function pollComments(ctx: MergeContext, organization: string, ref: MergeR
 /** Reports a change in the merge request's CI results; the first read records the baseline, as the ticket reports its own run. */
 async function pollChecks(ctx: MergeContext, organization: string, ref: MergeRequestRef, change: MergeRequestState, round: MergeRound): Promise<void> {
   const threadKey = mergeRequestKey(ref)
-  const checks = mergeChecksOf(await readJson(ctx, YUNXIAO.changeRequestChecks(organization, ref.repositoryId, ref.localId), round))
+  if (!change.patchSet) return
+  const checks = mergeChecksOf(await readJson(ctx, YUNXIAO.changeRequestChecks(organization, ref.repositoryId, ref.localId, change.patchSet), round))
     .sort((a, b) => a.name.localeCompare(b.name))
   // The fingerprint is the result set alone: the same checks against a new commit are the same run, and the commit itself is
   // the change step's news. Codeup answers with the checks of the merge request's latest commit, so a run that starts again

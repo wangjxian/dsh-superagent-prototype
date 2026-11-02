@@ -49,14 +49,18 @@ function fakeCli(answers: Answers) {
   aliyun.mockImplementation((async (first: unknown, second?: unknown) => {
     const argv = (Array.isArray(first) ? first : second) as string[]
     const command = argv[1]!
-    const id = argv[argv.indexOf('--workitem-id') + 1]!
+    const id = argv[argv.indexOf('--id') + 1]!
     if (command === 'projex-get-workitem') {
       const item = answers.workitems?.[id]
       if (!item) throw new Error(`StatusCode: 404 no work item ${id}`)
       return { workitem: item }
     }
     if (command === 'projex-list-workitem-comments') return { comments: answers.comments?.[id] ?? [] }
-    if (command === 'projex-list-workitem-relation-records') return { relationRecords: answers.relations?.[id] ?? [] }
+    if (command === 'projex-list-workitem-relation-records') {
+      // The CLI reads one relation type at a time: the parent alone, then the associated items.
+      const parent = argv[argv.indexOf('--relation-type') + 1] === 'PARENT'
+      return { relationRecords: (answers.relations?.[id] ?? []).filter(record => (record.relationType === 'PARENT') === parent) }
+    }
     throw new Error(`unexpected subcommand ${command}`)
   }) as never)
   return aliyun
@@ -85,7 +89,8 @@ it('reads a work item’s material: its description, its direct parent, and the 
   const result = await yunxiaoRead(commands, 'yunxiao/wi/123') as {
     workitem: Workitem; parent: Workitem; related: (Workitem & { comments: unknown[] })[]; unreadable_relations?: number }
   expect(aliyun.mock.calls[0]![1]).toEqual(YUNXIAO.workitem('org-1', '123'))
-  expect(aliyun.mock.calls[1]![1]).toEqual(YUNXIAO.workitemRelations('org-1', '123'))
+  expect(aliyun.mock.calls[1]![1]).toEqual(YUNXIAO.workitemRelations('org-1', '123', 'PARENT'))
+  expect(aliyun.mock.calls[2]![1]).toEqual(YUNXIAO.workitemRelations('org-1', '123', 'ASSOCIATED'))
   expect(result.workitem).toMatchObject({ id: '123', serial: 'AXOAXO-123', title: 'Item 123', description: 'Login fails', category: 'Bug',
     status: '28', assignee: 'agent-1', projectId: 'proj-1', url: workitemUrl('123'), modifiedAt: millis(1762045200000) })
   expect(result.parent).toMatchObject({ id: '900', title: 'Parent item' })
