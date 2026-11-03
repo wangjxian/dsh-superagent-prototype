@@ -17,6 +17,23 @@ const deployment = testDeployment({ github: { cli: '/path/agent-gh', login: 'age
 const REPOSITORY = deployment.repository
 const reply = { id: 'stable-operation', channel: githubChannel(8), text: 'Done', kind: 'reply' as const }
 describe('account-isolated operations', () => {
+  it('limits host QA publication to a configured non-trunk branch and bypasses hooks explicitly without force', async () => {
+    const configured = testDeployment({ github: undefined, codeup: testCodeup({
+      repositories: [{ id: 'repo-1', path: 'group/app', name: 'app', defaultBranch: 'trunk' }],
+    }) })
+    const commands = new Commands(() => configured, {}, new AbortController().signal)
+    const git = vi.spyOn(commands, 'git').mockResolvedValue('')
+    const sha = 'a'.repeat(40), directory = '/tmp/dsh-superagent-workspace/app'
+    for (const branch of ['master', 'main', 'trunk', '-qa']) await expect(commands.pushQa(branch, sha, directory)).rejects.toThrow('Invalid host QA publication')
+    await expect(commands.pushQa('qa', sha, '/elsewhere/app')).rejects.toThrow('Invalid host QA publication')
+    await expect(commands.pushQa('qa', 'not-a-commit', directory)).rejects.toThrow('Invalid host QA publication')
+    expect(git).not.toHaveBeenCalled()
+    await commands.pushQa('qa', sha, directory)
+    expect(git.mock.calls).toEqual([
+      [['check-ref-format', '--branch', 'qa'], directory],
+      [['push', '--no-verify', 'origin', `${sha}:refs/heads/qa`], directory],
+    ])
+  })
   it('uses the agent account\'s GitHub CLI and preserves literal shell metacharacters in argv', async () => {
     const commands = new Commands(() => deployment, {}, new AbortController().signal); const run = vi.spyOn(commands,'run').mockResolvedValue('{}')
     await commands.gh(['api','some-path','-f','body=`whoami` $(touch x)'])
@@ -237,6 +254,12 @@ describe('yunxiao calls', () => {
     expect(script).toContain(`exec '/path/agent-aliyun' 'devops' 'codeup-get-change-request' '--organization-id' 'org-1'`)
     // Without a schema, the raw output comes back untouched.
     expect(await value.aliyun(change)).toBe('log line\n{"localId":3}\n')
+  })
+  it.each(['[]', '[{"id":"wi-1"}]', 'CLI banner\n[{"id":"wi-1"}]'])('reads a top-level JSON array: %s', async output => {
+    const value = commands()
+    vi.spyOn(value, 'run').mockResolvedValue(output)
+    expect(await value.aliyun(z.array(z.object({ id: z.string() })), YUNXIAO.workitemComments('org-1', 'wi-1')))
+      .toEqual(output.includes('wi-1') ? [{ id: 'wi-1' }] : [])
   })
   it('reports a yunxiao failure with the HTTP status the CLI names and its message', async () => {
     const value = commands()

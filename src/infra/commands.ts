@@ -1,6 +1,6 @@
 /** Subprocess wrapper for running gh, aliyun, lark-cli, and git commands under the deployment's configured accounts. */
 import { execFile } from 'node:child_process'
-import { basename } from 'node:path'
+import { basename, join, resolve } from 'node:path'
 import { setTimeout as delay } from 'node:timers/promises'
 import { promisify } from 'node:util'
 import { z } from 'zod'
@@ -139,7 +139,7 @@ export class Commands {
     const schema = isSchema(first) ? first : undefined
     const argv = isSchema(first) ? second ?? [] : first
     const output = await this.yunxiao(argv)
-    return schema ? schema.parse(JSON.parse(output.slice(Math.max(0, output.indexOf('{'))))) : output
+    return schema ? schema.parse(JSON.parse(output.slice(Math.max(0, output.search(/[{\[]/))))) : output
   }
   /**
    * Runs one yunxiao call, retrying a read-only subcommand after a 5xx or a call that never reached the service.
@@ -178,4 +178,13 @@ export class Commands {
   }
   /** Runs `git` on PATH using the agent's isolated git environment and credential helper. */
   async git(args: string[], cwd: string): Promise<string> { return this.run('git', args, cwd) }
+  /** The host bypasses worker hooks explicitly; normal push still refuses a non-fast-forward update. */
+  async pushQa(branch: string, commit: string, cwd: string): Promise<void> {
+    const account = this.codeup
+    const repository = account.repositories.find(item => resolve(join(account.workspace, item.name)) === resolve(cwd))
+    if (!repository || !/^[A-Za-z0-9][A-Za-z0-9._/-]*$/.test(branch) || ['master', 'main', repository.defaultBranch].includes(branch)
+      || !/^[a-f0-9]{40}$/i.test(commit)) throw new Error('Invalid host QA publication')
+    await this.git(['check-ref-format', '--branch', branch], cwd)
+    await this.git(['push', '--no-verify', 'origin', `${commit}:refs/heads/${branch}`], cwd)
+  }
 }

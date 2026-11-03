@@ -183,11 +183,7 @@ Setup must succeed before polling or work starts. Overview lists missing require
    git -C /home/me/src/widgets worktree add -b "agent/$DSH_SUPERAGENT_NAME" "$DSH_SUPERAGENT_DIR" "refs/dsh-superagent/$DSH_SUPERAGENT_TICKET"
    ```
 
-   On Codeup the Ticket's branch comes from the Ticket's instructions, and the worktree is added from the checkout in the workspace:
-
-   ```sh
-   git -C "$DSH_SUPERAGENT_WORKSPACE/<repository>" worktree add -b "bugfix/<yymmdd>-<description>-$DSH_SUPERAGENT_NAME" "$DSH_SUPERAGENT_DIR" master
-   ```
+   On Codeup, a Yunxiao work item uses its serial alone, such as AXOAXO-6812. Inspect the existing directory and git worktree list first. Reopen/retry reuses the same worktree and preserves unfinished edits. Only a new branch uses worktree add -b from the assigned development base, normally origin/master or origin/main. An existing unoccupied branch uses worktree add without -b. An unexpected occupied location stops work rather than moving it. Each involved repository gets its own `<ticket directory>/<repository name>` worktree; leave operator checkouts unchanged and never start development from QA. Other-source Tickets retain bugfix/feat conventions.
 
    List personal CLIs, such as one signed in to your own account, as blocked commands.
 4. **Prompts.** Set the team sections: the disclosure line, review bots, the commit author and the auto-merge condition, which applies to GitHub only.
@@ -195,6 +191,8 @@ Setup must succeed before polling or work starts. Overview lists missing require
 ### Yunxiao work items
 
 The yunxiao Source turns work items assigned to the agent into Tickets. Its receiving rules live in one YAML file, `~/.config/dsh-superagent/yunxiao.yml` unless the Source's card names another path. The Source rereads the file before every poll: a file it cannot validate reports a health error and the last valid rules keep working, and a missing file leaves the Source paused until it is written. The file's digest is part of the Policy version, so changing it discards evaluations in flight.
+
+Select the work-item categories per project with `projects[].types`: keep only the `category: Bug` entry for bugs only, only `category: Task` for tasks only, or both entries for both. Keep each selected category's receive/started/verified status mapping. The running deployment currently receives Bug only; the Task mapping is commented in its rule file for restoration. Confirm there are no active tickets of a category before removing its mapping, since existing tickets still use that mapping for status write-back. The next successful poll loads the choice automatically.
 
 ```yaml
 organization: "62cf7f0b487c500c27f70f94"   # must match the Codeup account's organization
@@ -209,10 +207,11 @@ projects:
         receive: ["28", "30"]               # 待确认、再次打开: statuses a Ticket may start in
         started: "100010"                   # 处理中
         verified: "29"                      # 已修复
-      - category: Task                      # 任务
-        receive: ["100005"]
-        started: "100010"
-        verified: "100014"
+      # Opt in to Task by uncommenting this entry; Bug-only is the recommended starting configuration.
+      # - category: Task                    # 任务
+      #   receive: ["100005"]
+      #   started: "100010"
+      #   verified: "100014"
 # A requirement (Req) is never received: it is read as the work item's related context.
 release:                                    # where a delivery goes: the branch pattern, the trunk, the zone
   pattern: "release/{yyyymmdd}"             # the day placeholder; the text before it narrows the branch listing
@@ -227,15 +226,49 @@ approver:
 
 Statuses are ids, not names: they are shared across the organization and may be numbers or hexadecimal strings, so write every one of them as a string. The file holds no credential. Unknown keys and duplicate keys are refused, so a typo fails the validation instead of being ignored.
 
-A poll searches each configured project for work items whose `gmtModified` moved since the last poll, in every receive status, and opens a Ticket for one assigned to the agent. A work item that was verified or closed and comes back to a receive status starts a new repair cycle, which opens a new Ticket. Comments of a work item with a live Ticket, or with a Ticket that still follows it, arrive as follow-ups; a comment the agent wrote carries a hidden marker and is skipped.
+A poll searches each configured project for work items whose `gmtModified` moved since the last poll, in every receive status, and opens a Ticket for one assigned to the agent. A work item that was verified or closed and comes back to a receive status starts a new repair cycle and resumes its existing Ticket and execution directory. Comments of a work item with a live Ticket, or with a Ticket that still follows it, arrive as follow-ups; a comment the agent wrote carries a hidden marker and is skipped.
 
-A project whose `intake` is `triage` asks before it starts: the Source sends the approver one Feishu direct message with the work item's serial, title, description and link. The reply decides by its first word: `开工`, `开始`, `可以`, `做吧`, `ok` or `go` starts the work and anything after it is read as a supplement the worker receives; a refusal such as `先不`, `暂缓` or `等产品确认` leaves the work item alone; and a reply that says neither, such as a question or `looks good`, decides nothing, so the question stays open and the approver can answer again. A refusal wins over a start in one message, and a work item that comes back in a new cycle asks again. A project whose `intake` is `direct` starts at once. A deployment with no approver configured falls back to starting directly and says so in the Source's health.
+A project whose `intake` is `triage` does not hand its work items to a worker at once: the work item's arrival is recorded as an observation rather than as a request, so the assessment decides what it is. When the assessment settles the direction, the work starts as it does anywhere else; when it cannot — the request is unclear, or the target is undecided — the host asks the approver in a Feishu direct message, quoting the assessment's reason, and the approver's answer decides. A yes comes back to the Ticket's thread as an explicit request from the approver, with anything they added after the first word travelling as a supplement; a no is remembered for that repair cycle, so the same work item is not asked about twice; a reply that decides nothing leaves the question open. A refusal reads anywhere in the reply and outranks a yes.
+
+A project whose `intake` is `direct` starts at once. A triage confirmation with no approver configured stays queued until an approver is available; it never falls back to starting work directly. Question delivery retries through the durable effect queue, including after restart. Approval rechecks the current work item and repair cycle before dispatch.
 
 When the Ticket starts, the host moves the work item to the category's `started` status, once per Ticket. When the work item is assigned to somebody else while a Ticket runs, the Source stops that Ticket and leaves one comment saying so. When the Ticket ends, the host writes one result comment on its work item — the state, the root cause, the changes and the verification evidence, never a statement's body — and moves the work item to the type's `verified` status when the work item is 已修复. A workflow that refuses a move keeps the comment and reports the refusal in the Source's health; a Ticket a person stopped writes nothing back.
 
 The Ticket's own conversation is the approver's direct chat: a Ticket that came from a work item sends its acknowledgements, questions and failure notices to the approver in Feishu rather than to the work item a colleague watches, and an answer there reaches the Ticket. The result comment on the work item is written by the host when the Ticket ends, as described above.
 
-### Merging a change request
+### Yunxiao fixed-QA delivery
+
+One work item may affect several workspace repositories. Each project has one QA pipeline with a fixed non-trunk source branch, release/qa in the configured sandbox examples. The worker declares the complete project set, keeps development named only by the work-item serial, and calls orchestrator_qa_prepare for every project's actual local unit tests. merge_mode selects direct (default) or merge-request. qa_prepare and qa_test accept timeout_ms from 1 second to 24 hours; default is ten minutes.
+
+The pipeline must be manually triggered. Nonempty source triggerEvents, including push and mergeRequestMerged, are rejected before any merge or push; the host does not change a project's trigger policy silently. Configure a separate manual QA pipeline when automatic triggers must remain. See [Flow source trigger syntax](https://help.aliyun.com/en/yunxiao/user-guide/pipeline-sources).
+
+The host merges tested commits while preserving QA history and source branches. Its direct push uses explicit --no-verify without force; no environment variable grants host capability. MR identity is persisted before native checks or merge, and QA reviews return to the original ticket. Native approval requirements remain effective. Codeup has no expected-source-SHA merge argument, so MR source updates must be serialized during merge; unexpected changes block subsequent QA execution.
+
+Codeup branch protection is separate from the release/{yyyymmdd} naming rule. A server protection pattern release/* also covers release/qa: direct mode needs the agent's push permission on that specific QA branch, or the project must use merge-request and satisfy native approvals. Do not grant blanket release push access to work around a QA failure. The branch comes from pipeline YAML; release/qa is an example, not a product-wide constant.
+
+If that YAML target changes, prepare can adopt it without manual KV edits once the affected project's builds and known old QA MRs are finished. It checks active runs, the latest/recorded run and pending MR state, reruns all project unit tests, and invalidates the old receipt, delivery intention and environment-test cache. Active, unknown or unreadable delivery state keeps the old plan; wait/cancel the named build or complete/close the named MR, then rerun prepare. Historical reports and remote branches are retained.
+
+Remote heads are refreshed with +refs/heads/<branch>:refs/remotes/origin/<branch>. The plus only updates the local tracking cache, so a team rebuild does not leave fetch stuck; it does not rewrite any remote branch or permit a force push. Ancestry/current-commit checks decide whether the rebuilt branch still includes the required work. Codeup reviewer credit is added only to new substantive commits and requires testing/publication again; shared GitHub history-rewriting rules do not apply.
+
+Conflicts are resolved on a QA-only `<serial>-qa` branch created FROM development, in `<ticket directory>/.qa/<repository>`. Merge QA there and retain both sides; never merge QA into development. Pass integration_branch to prepare so the host tests both development and candidate and verifies containment. The QA-only branch must never be delivered to master/release. Existing branches and dirty/occupied worktrees are preserved.
+
+When a QA-only MR replaces the tracked development-to-QA MR, the host creates/reuses the replacement first, verifies and closes the old MR, then retires its follow without erasing history. A lost close response is reconciled by rereading its native state. QA conflict notices point to the QA-only branch, not to editing development. Result comments show host-resolved repository names while reports retain canonical IDs.
+
+The MR polling index is temporary: superseded, closed/gone or orphan mappings are removed after their follow is retired, with a per-round retired set preventing stale snapshots from polling them again. Ticket/follow history remains. Unknown pending reviews are retained even after a non-fix conclusion so reopening keeps the QA review context.
+
+The host records a delivery intention before writes, then runs the ordinary fixed-QA pipeline. A pending create attempt and a known returned run ID are persisted before reuse decisions. Lost create-run responses are reconciled using actual checkout metadata and ancestry; an unchanged latest run or unreadable result blocks another create. A later QA head alone does not discard a successful publication or its MR link. This tracks each work item's attempts; it is not a distributed pipeline lock across hosts.
+
+Completion uses containment rather than head equality. Current QA and the actual tested deployment must contain this work item's tested development commit and QA candidate when used. qa_test accepts deployments [{repository,pipeline_id,run_id}] for later shared builds. It verifies successful native run.sources metadata and passes the actual build qaCommit in DSH_QA_EXPECTED_PROJECTS. The environment test matches integration_commit/pipelineId/runId and exercises the main flow; a colleague's development metadata stamp need not match our required commit. Later QA merges do not invalidate successful evidence; changed work-item code, missing ancestry, failed builds, omitted projects or a different untested build do.
+
+A new repair cycle invalidates the old project plan and QA test before the Ticket resumes, even if development has the same SHA. Recording the cycle trigger and invalidating its acceptance happen atomically; retries of that same cycle keep its fresh evidence. Historical reports, publications and review context remain available.
+
+Scope comes from the full project plan plus locally discovered ticket worktrees. Only involved repositories are fetched, with one batch per project; unrelated remotes are not scanned. Remote-only undeclared work is not auto-discovered: the worker and assignment must name every affected project.
+
+Repair ready requires host-recorded successful QA testing. The final comment gives concise project/unit results, short QA commits, pipeline runs, MR links and QA entry; raw logs stay in the internal execution record. Explicit non-fix statuses 无需修改/待确认/待验证/阻塞 record a conclusion without requiring repair QA or moving the item to verified. QA work items do not use legacy release approvals or PRE as their completion gate.
+
+### Other-source Codeup merge approvals
+
+For Codeup tickets that did not originate as Yunxiao work items, the following legacy approval workflow remains:
 
 A worker delivers a branch and its merge request; it never merges. Merging is the host's, and only after the approver confirms the target release in a Feishu direct message. The worker asks with `orchestrator_request_merge` once its work is self-reviewed, and the host:
 
@@ -248,9 +281,9 @@ A merged merge request does not end the Ticket: it keeps following it for its me
 
 The approver is `approver.feishuOpenId` in the receiving rules. When that is empty, the first direct message the approver sends the bot binds them, so a deployment can start without it. The confirmation message must be answered by replying to it: a direct message that answers nothing else is ordinary conversation.
 
-### Deploying and verifying on PRE
+### PRE for other-source Codeup delivery
 
-After the host merges a change request it tells the Ticket so, and the worker deploys and verifies on PRE itself: it finds the environment's pipeline by name — a `qa-` one for QA and a `pre-` one for PRE, such as `pre-axo-manager-x64` — starts it, follows the run, and reads a failed task's log. A defect in the change is fixed and delivered again; an occasional failure is retried. The pipelines a worker may start or retry are the ones named by `pipelines.allowPrefixes` in the receiving rules (`qa-` and `pre-` by default), compared without regard to case: the forwarding script reads the pipeline's name first and refuses everything else, including `prod-` and `prod-pre-`, with a message that points at `orchestrator_request_pipeline`. A change to those prefixes reaches the workers on the next poll, because the Source rewrites the list the script reads — unless that file was written by hand, which the host never replaces and reports in the Source's health instead. That tool asks the approver in a Feishu direct message, and the host starts the pipeline itself when they agree.
+For other-source Codeup tickets, after merging the host tells the Ticket, and the worker deploys and verifies on PRE. It uses the environment's pipeline by name, such as pre-axo-manager-x64, follows the run and fixes failures. pipelines.allowPrefixes controls these legacy worker runs; other pipelines need orchestrator_request_pipeline and approval. This is separate from the Yunxiao work-item QA completion gate.
 
 Once PRE is deployed, the worker reproduces the original problem there and verifies the fix, then reports ready with the verification it ran. The host then moves the work item to its verified status, comments the result, and the Ticket ends. A verification that fails, or a person writing on the work item, in Feishu or on the merge request, brings the Ticket back to its worker.
 
@@ -332,8 +365,8 @@ The process environment that setup writes:
 
 - **Command shims** in `<stateDir>/worker-bin`, first on `PATH`: `gh` runs the agent's CLI where a GitHub account is configured; `aliyun` is a forwarding script where a Codeup account is configured; `lark-cli` runs the bot's CLI; `security` always fails, so no worker reads the keychain; blocked commands fail. A shim removes its own directory from `PATH` before it runs its target.
 - **git configuration** in `<stateDir>/worker-gitconfig`: replaces the operator's global and system git configuration. It selects the agent CLI as the github.com credential helper, rewrites GitHub SSH addresses to HTTPS and Codeup HTTPS addresses to `git@codeup.aliyun.com:`, points `core.hooksPath` at `<stateDir>/worker-hooks`, and defines Git LFS filters. Personal git settings such as an HTTP proxy do not apply. No commit identity is set here, git never prompts for credentials, and `GH_TOKEN` and `GITHUB_TOKEN` are removed.
-- **Hooks** in `<stateDir>/worker-hooks`: the `pre-push` hook admits only `refs/heads/bugfix/*` and `refs/heads/feat/*` and refuses a branch deletion, so a worker cannot push a release branch; the other hooks run the repository's own hook of the same name, which `core.hooksPath` would otherwise hide.
-- **The `aliyun` forwarding script** runs the real CLI only for what a worker needs: the read-only `base-get-user-by-token`, `codeup-get-*`, `codeup-list-*`, `projex-get-*`, `projex-list-*`, `projex-search-*`, `flow-get-*` and `flow-list-*`; a merge request whose source branch is `bugfix/` or `feat/`; and a merge request comment, to which it appends the hidden marker and the line saying an agent posted it. Merging, approving, deleting, branch protection, work-item writes, pipeline runs and application or package management are refused: the host performs them, or a later phase does. Phase one runs no pipeline.
+- **Hooks** in `<stateDir>/worker-hooks`: pre-push admits only the exact work-item serial and QA-only `<serial>-qa`, or bugfix/feat branches for other-source Tickets. It rejects branch deletion and non-fast-forward updates. Other hooks forward repository hooks as before. This prevents accidental pushes; it is not an OS security boundary. Configure Codeup protection on master/release to prevent direct worker pushes.
+- **The `aliyun` forwarding script** permits required read-only commands and disclosed MR comments. Other-source Tickets may create bugfix/feat MRs; work-item QA MRs use the host tools. Merge, approval, branch protection, work-item mutation and fixed-QA pipeline starts remain host operations. No worker environment variable grants host QA push rights.
 
 A file in `worker-bin` or `worker-gitconfig` that dsh-superagent did not write stops setup. A Ticket directory inside a git repository whose own configuration adds credentials fails the Ticket.
 

@@ -5,6 +5,7 @@ import { CliError, Commands, commandError } from '../src/infra/commands.ts'
 import { AGENT_COMMENT } from '../src/infra/yunxiao.ts'
 import { sendYunxiao, workitemGone, yunxiaoLink } from '../src/sources/yunxiao-channel.ts'
 import { isAgentComment, workitemChannel } from '../src/sources/yunxiao-trigger.ts'
+import { mergeRequestChannel } from '../src/sources/yunxiao-mr.ts'
 import { testCodeup, testDeployment } from './fixtures/deployment.ts'
 
 /** A deployment whose code hosting is Codeup, which is the account the yunxiao CLI acts for. */
@@ -21,6 +22,58 @@ const comments = (...bodies: string[]): string =>
 const LIST = ['devops', 'projex-list-workitem-comments', '--organization-id', 'org-1', '--id', '123']
 
 describe('the yunxiao channel', () => {
+  const mrReply = { ...reply, channel: mergeRequestChannel({ repositoryId: 'repo-1', localId: 12 }, 'comment-1') }
+  it('replies to a merge request comment using its source patch set and parent comment', async () => {
+    const value = commands()
+    const aliyun = vi.spyOn(value, 'aliyun').mockResolvedValueOnce([{ comment_biz_id: 'comment-1', content: 'review', related_patchset: { patchSetBizId: 'patch-1' } }])
+      .mockResolvedValueOnce('')
+    expect(await sendYunxiao({ commands: value }, mrReply)).toBe('sent')
+    expect(aliyun.mock.calls[0]![1]).toContain('codeup-list-merge-request-comments')
+    expect(aliyun.mock.calls[1]![0]).toEqual(['devops', 'codeup-create-change-request-comment', '--organization-id', 'org-1',
+      '--repository-id', 'repo-1', '--local-id', '12', '--comment-type', 'GLOBAL_COMMENT', '--draft', 'false', '--resolved', 'false',
+      '--patchset-biz-id', 'patch-1', '--content', `${reply.text}\n\n${MARKER}\n${AGENT_COMMENT}`, '--parent-comment-biz-id', 'comment-1'])
+    expect(aliyun).toHaveBeenCalledTimes(2)
+  })
+  it('reconciles a previously sent merge request reply before looking up a patch set or writing', async () => {
+    const value = commands()
+    const aliyun = vi.spyOn(value, 'aliyun').mockResolvedValue([{ child_comments_list: [{ content: MARKER }] }])
+    expect(await sendYunxiao({ commands: value }, mrReply)).toBe('sent')
+    expect(aliyun).toHaveBeenCalledTimes(1)
+  })
+  it('refuses another repository and invalid merge request ids before making any calls', async () => {
+    const value = commands()
+    const aliyun = vi.spyOn(value, 'aliyun')
+    for (const address of [{ repository: 'other', localId: '12' }, { repository: 'repo-1', localId: '0' }]) {
+      await expect(sendYunxiao({ commands: value }, { ...mrReply, channel: { ...mrReply.channel, address } })).rejects.toThrow()
+    }
+    expect(aliyun).not.toHaveBeenCalled()
+  })
+  it('does not post a merge request reply without a source patch set', async () => {
+    const value = commands()
+    const aliyun = vi.spyOn(value, 'aliyun').mockResolvedValueOnce([{ comment_biz_id: 'comment-1', content: 'review' }]).mockResolvedValueOnce([])
+    await expect(sendYunxiao({ commands: value }, mrReply)).rejects.toThrow('no source patch set')
+    expect(aliyun).toHaveBeenCalledTimes(1)
+  })
+  it('replies to an inline comment on its original comparison and line, even after a new patch set', async () => {
+    const value = commands()
+    const aliyun = vi.spyOn(value, 'aliyun').mockResolvedValueOnce([{ comment_biz_id: 'comment-1', content: 'inline review',
+      comment_type: 'INLINE_COMMENT', filePath: 'README.md', line_number: 7, from_patchset_biz_id: 'base', to_patchset_biz_id: 'old-source' }])
+      .mockResolvedValueOnce('')
+    expect(await sendYunxiao({ commands: value }, mrReply)).toBe('sent')
+    expect(aliyun).toHaveBeenCalledTimes(2)
+    expect(aliyun.mock.calls[1]![0]).toEqual(['devops', 'codeup-create-change-request-comment', '--organization-id', 'org-1',
+      '--repository-id', 'repo-1', '--local-id', '12', '--comment-type', 'INLINE_COMMENT', '--draft', 'false', '--resolved', 'false',
+      '--patchset-biz-id', 'old-source', '--content', `${reply.text}\n\n${MARKER}\n${AGENT_COMMENT}`, '--parent-comment-biz-id', 'comment-1',
+      '--file-path', 'README.md', '--line-number', '7', '--from-patchset-biz-id', 'base', '--to-patchset-biz-id', 'old-source'])
+  })
+  it('does not guess the thread or comparison when the parent comment is missing or incomplete', async () => {
+    for (const comments of [[], [{ comment_biz_id: 'comment-1', comment_type: 'INLINE_COMMENT' }]]) {
+      const value = commands()
+      const aliyun = vi.spyOn(value, 'aliyun').mockResolvedValue(comments)
+      await expect(sendYunxiao({ commands: value }, mrReply)).rejects.toThrow()
+      expect(aliyun).toHaveBeenCalledTimes(1)
+    }
+  })
   it('posts the reply as a work-item comment, carrying its own marker and the one every agent comment carries', async () => {
     const value = commands()
     const aliyun = vi.spyOn(value, 'aliyun').mockResolvedValue('')

@@ -1,13 +1,29 @@
 /** Write-back of a finished ticket to the work item it came from: the result comment people read, and the status it moves to. */
 import { latestReport, type Assignment, type Ticket } from '../core/index.ts'
+import { z } from 'zod'
 import type { Commands } from '../infra/commands.ts'
 import { AGENT_COMMENT, YUNXIAO } from '../infra/yunxiao.ts'
 import { workitemGone } from './yunxiao-channel.ts'
 import { projectOf, typeOf, type YunxiaoFile, type YunxiaoType } from './yunxiao-config.ts'
+export const QaEvidenceSchema = z.object({ repository: z.string().min(1), repository_name: z.string().trim().min(1).optional(), pipeline_id: z.string().min(1), run_id: z.string().min(1),
+  main_flow_passed: z.literal(true), evidence: z.string().trim().min(1), commit: z.string().regex(/^[a-f0-9]{40}$/i).optional(),
+  qa_branch: z.string().optional(), qa_commit: z.string().regex(/^[a-f0-9]{40}$/i).optional(), merge_request: z.number().int().positive().optional(), merge_request_url: z.string().url().optional(),
+  unit_tests: z.object({ command: z.string(), commit: z.string(), output: z.string() }).optional() })
+const QaGroupSchema = z.object({ repositories: z.array(QaEvidenceSchema).min(1)
+  .refine(items => new Set(items.map(item => item.repository)).size === items.length, 'Duplicate QA repository'),
+  main_flow_passed: z.literal(true), evidence: z.string().trim().min(1), environment: z.string().optional(),
+  test_command: z.string().optional(), test_output: z.string().optional(), tested_at: z.string().optional() })
+/** Older single-repository reports remain readable; new reports carry the whole work item's QA result. */
+export const QaResultSchema = z.union([QaGroupSchema, QaEvidenceSchema.transform(item => ({
+  repositories: [item], main_flow_passed: true as const, evidence: item.evidence,
+}))])
+export const VerifiedQaSchema = z.union([QaGroupSchema.extend({ verified: z.literal(true) }), QaEvidenceSchema.extend({ verified: z.literal(true) })])
 
 /** The handling a finished ticket reports, in the vocabulary the team reads on a work item. */
 export type Handling = '已修复' | '待验证' | '阻塞' | '待确认' | '无需修改'
 const HANDLINGS: readonly Handling[] = ['已修复', '待验证', '阻塞', '待确认', '无需修改']
+/** Explicit non-fix conclusions write a comment without claiming that code was QA verified. */
+export const nonFixConclusion = (value: unknown): boolean => ['待验证', '阻塞', '待确认', '无需修改'].includes(typeof value === 'string' ? value.trim() : '')
 /** What a write-back settled: whether the work item holds the comment, the status it moved to, and what kept that move. */
 export interface WriteBack {
   /** Whether the work item now holds the result comment; false when it no longer exists or no longer takes comments. */
@@ -50,6 +66,10 @@ function prose(value: unknown): string {
 }
 /** The bullet lines of a result field, so a list of changes reads as a list in the comment. */
 const bullets = (value: unknown): string[] => prose(value).split('\n').map(line => line.trim()).filter(Boolean)
+const brief = (value: string, limit: number): string => {
+  const text = value.replace(/\s+/g, ' ').trim()
+  return text.length > limit ? text.slice(0, limit) + '…' : text
+}
 /**
  * The SQL files a result names, by file name only: the comment never carries a statement's body, so a string that is not a
  * plain `.sql` file name is left out, and a record contributes only the file it names.
@@ -82,10 +102,11 @@ function endedAs(ticket: Ticket): Handling {
  */
 function handlingOf(ticket: Ticket, report: Assignment['report']): Handling {
   const result = report?.result ?? {}
+  const verified = report?.state === 'ready' && !!prose(result.verification) && VerifiedQaSchema.safeParse(result.qa).success
   const stated = declared(result.status)
-  if (stated) return stated === '已修复' && !prose(result.verification) ? '待验证' : stated
+  if (stated) return stated === '已修复' && !verified ? '待验证' : stated
   switch (report?.state) {
-    case 'ready': return prose(result.verification) ? '已修复' : '待验证'
+    case 'ready': return verified ? '已修复' : '待验证'
     case 'dropped': return '无需修改'
     case 'blocked': case 'failed': return '阻塞'
     // A ticket that ended while its worker was still working or waiting ended without a verified result, so nothing here
@@ -104,12 +125,20 @@ function handlingOf(ticket: Ticket, report: Assignment['report']): Handling {
 export function resultComment(ticket: Ticket, report: Assignment['report'], type?: YunxiaoType): string {
   const result = report?.result ?? {}
   const parts: string[] = [handlingOf(ticket, report)]
-  const cause = prose(result.root_cause)
+  const cause = brief(prose(result.root_cause), 300)
   if (cause) parts.push(`根因：${cause}`)
   const changes = bullets(result.changes)
-  if (changes.length) parts.push(['修改内容：', ...changes.map(line => `- ${line}`)].join('\n'))
-  const verification = prose(result.verification)
+  if (changes.length) parts.push(['修改内容：', ...changes.map(line => `- ${brief(line, 180)}`)].join('\n'))
+  const qa = VerifiedQaSchema.safeParse(result.qa)
+  const group = qa.success && 'repositories' in qa.data ? qa.data : undefined
+  const verification = group ? 'QA 主流程验收通过；详细执行记录保留在工单中。' : brief(prose(result.verification), 300)
   if (verification) parts.push(`验证证据：${verification}`)
+  if (group) parts.push(['QA 集成：', ...group.repositories.map(item => {
+    const count = item.unit_tests && /\bRan (\d+) tests?\b/.exec(item.unit_tests.output)?.[1]
+    return `- ${item.repository_name ?? item.repository}：${item.unit_tests ? `单测${count ? ` ${count} 项` : ''}通过；` : ''}流水线 ${item.pipeline_id} #${item.run_id} 通过`
+      + (item.qa_commit ? `（${item.qa_branch ?? 'QA'} ${item.qa_commit.slice(0, 7)}）` : item.commit ? `（${item.commit.slice(0, 7)}）` : '')
+      + (item.merge_request ? `；MR !${item.merge_request}${item.merge_request_url ? ` ${item.merge_request_url}` : ''}` : '')
+  }), ...group.environment ? [`QA 环境：${group.environment}`] : []].join('\n'))
   const sql = sqlFiles(result.sql)
   if (sql.length) parts.push(['SQL 文件（正文见仓库）：', ...sql.map(file => `- ${file}`)].join('\n'))
   return [...parts, AGENT_COMMENT].join('\n\n')

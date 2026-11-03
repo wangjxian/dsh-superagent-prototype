@@ -46,6 +46,13 @@ it('passes plain text through, and reads nothing out of an absent value', () => 
   expect(richText(undefined)).toBe('')
   expect(richText({})).toBe('')
 })
+it('reads the JSON-string wrapper the current work-item and review editors return', () => {
+  const value = { htmlValue: '<p>QA <strong>passed</strong></p>', jsonMLValue: ['p', {}, 'QA passed'] }
+  expect(richText(JSON.stringify(value))).toBe('QA **passed**')
+  expect(richText(value)).toBe('QA **passed**')
+  expect(richText(JSON.stringify({ jsonMLValue: ['p', {}, 'QA passed'] }))).toBe('QA passed')
+  expect(richText('{"price":1}')).toBe('{"price":1}')
+})
 it('tolerates markup a parser would reject, without losing the readable text', () => {
   expect(richText('<p>unclosed')).toBe('unclosed')
   expect(richText('<p>a</div>b</p>')).toBe('ab')

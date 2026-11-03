@@ -8,11 +8,11 @@ import { key, type ChannelRef, type ThreadRef, type Trigger } from '../core/inde
 import { KV } from '../kv.ts'
 import { CliError, type Commands } from '../infra/commands.ts'
 import { releaseBranchDay, targetRelease, type TargetRelease } from '../infra/release.ts'
-import { YUNXIAO } from '../infra/yunxiao.ts'
+import { YUNXIAO, type InlineComment } from '../infra/yunxiao.ts'
 import { repositoryOf } from './codeup-hosting.ts'
 import type { SourceContext } from './host.ts'
 import type { YunxiaoFile } from './yunxiao-config.ts'
-import { isAgentComment, SOURCE } from './yunxiao-trigger.ts'
+import { isAgentComment, SOURCE, yunxiaoRef } from './yunxiao-trigger.ts'
 import { richText } from './yunxiao-text.ts'
 
 /**
@@ -20,7 +20,7 @@ import { richText } from './yunxiao-text.ts'
  * open tickets whose `follows` name the merge requests, the Codeup account whose repositories the release rule reads, and the
  * Engine. A full `SourceContext` is one, so the work-item Source passes its own context unchanged.
  */
-export type MergeContext = Pick<SourceContext, 'commands' | 'state' | 'tickets' | 'receive' | 'deployment'>
+export type MergeContext = Pick<SourceContext, 'commands' | 'state' | 'tickets' | 'receive' | 'deployment' | 'triggers'>
 
 /**
  * What one polling round hands the merge-request poller: when the round started (the observation time of a Trigger the
@@ -295,6 +295,8 @@ export interface MergeRequestComment {
   url?: string
   /** The comment it answers, when Codeup names one. */
   parent?: string
+  patchSet?: string
+  inline?: InlineComment
   /** The hidden `AGENT_COMMENT` marker was in the raw body, so the comment is the agent's own write. */
   agent?: true
 }
@@ -310,8 +312,14 @@ export function mergeCommentOf(raw: unknown): MergeRequestComment {
   const author = recordOf(first(comment, COMMENT_FIELD.author))
   const url = stringOf(first(comment, COMMENT_FIELD.url))
   const parent = stringOf(first(comment, COMMENT_FIELD.parent))
+  const patchSet = stringOf(recordOf(comment.related_patchset)?.patchSetBizId)
+  const inline = comment.comment_type === 'INLINE_COMMENT' ? z.object({ filePath: z.string().min(1), line_number: z.number().int().positive(),
+    from_patchset_biz_id: z.string().min(1), to_patchset_biz_id: z.string().min(1) }).parse(comment) : undefined
   return { id, body, author: idOf(author) ?? '', human: !isBotUser(author), at: created ?? '',
     modifiedAt: timeOf(first(comment, COMMENT_FIELD.modified)) ?? created ?? '', ...url ? { url } : {}, ...parent ? { parent } : {},
+    ...patchSet ? { patchSet } : {},
+    ...inline ? { inline: { filePath: inline.filePath, lineNumber: inline.line_number,
+      fromPatchSet: inline.from_patchset_biz_id, toPatchSet: inline.to_patchset_biz_id } } : {},
     // The marker survives in the raw body even when the Markdown conversion drops the HTML comment that carries it.
     ...(typeof rawBody === 'string' && isAgentComment(rawBody)) || isAgentComment(body) ? { agent: true as const } : {} }
 }
@@ -387,14 +395,16 @@ export function mrCommentTrigger(comment: MergeRequestComment, ref: MergeRequest
  * duplicate instead of a second piece of work. `human` is false because Codeup observed this, not a person; the ticket's
  * worker still receives it as an input on the Thread it follows.
  */
-export function mrChangeTrigger(ref: MergeRequestRef, change: MergeRequestState, at: string): Trigger {
+export function mrChangeTrigger(ref: MergeRequestRef, change: MergeRequestState, at: string, qaSerial?: string): Trigger {
   const title = change.title ? ` "${change.title}"` : ''
   const target = change.target ? `, targeting ${change.target}` : ''
   const lines = [`Merge request !${ref.localId}${title} in ${ref.repositoryId} is at ${short(change.head)}${target}.`]
   if (change.conflict) {
-    lines.push(`It conflicts with ${change.target || 'its target branch'}: the source branch must be updated before it can merge.`)
+    lines.push(qaSerial
+      ? `It conflicts with ${change.target || 'its target branch'}. Keep development branch ${qaSerial} unchanged. Create or reuse QA-only ${qaSerial}-qa from its tested development commit, merge the QA target only there, resolve and test, then prepare all projects with integration_branch=${qaSerial}-qa and retry. Never merge QA into development or rewrite its history.`
+      : `It conflicts with ${change.target || 'its target branch'}: the source branch must be updated before it can merge.`)
   }
-  return { id: key('yunxiao-mr-change', mergeRequestKey(ref), change.head, change.conflict ? 'conflict' : 'clean'), source: SOURCE,
+  return { id: key('yunxiao-mr-change', mergeRequestKey(ref), change.head, change.conflict ? 'conflict' : 'clean', ...(qaSerial ? ['qa'] : [])), source: SOURCE,
     threads: [mergeRequestThread(ref.repositoryId, ref.localId)], actor: { source: SOURCE, id: '' }, human: false, at,
     text: lines.join('\n'), channel: mergeRequestChannel(ref), ...change.url ? { url: change.url } : {},
     meta: { repository: ref.repositoryId, localId: ref.localId, kind: 'mr-change', head: change.head, conflict: change.conflict,
@@ -462,8 +472,32 @@ async function step(round: MergeRound, threadKey: string, what: string, work: ()
  * Thread and is recorded as gone, so a deleted merge request cannot fail every round of the Source for the rest of its life.
  */
 export async function pollMergeRequests(ctx: MergeContext, file: YunxiaoFile, round: MergeRound): Promise<void> {
+  const retired = new Set<string>()
+  for (const key of ctx.state.keys(KV.yunxiao.qaMr)) {
+    if (!key.startsWith(`${KV.yunxiao.qaMr.prefix}${file.organization}:`)) continue
+    const pending = ctx.state.get(key)
+    if (!pending) continue
+    const ticket = ctx.tickets.get(pending.ticketId)
+    const origin = ticket && ctx.triggers.get(ticket.origin.triggerId)
+    const thread = mergeRequestThread(pending.repository, pending.mergeRequest)
+    const threadKey = `${thread.source}:${thread.id}`
+    const follow = ticket?.follows?.find(follow => follow.thread === threadKey)
+    if (pending.superseded && ticket && !ticket.ended && follow && !follow.closed) ctx.tickets.threadClosed(thread, 'closed', round.started)
+    const gone = ctx.state.get(KV.yunxiao.mr(threadKey))?.gone
+    if (pending.superseded || !ticket || !origin || !yunxiaoRef(origin).workitemId || follow?.closed || gone) {
+      retired.add(threadKey)
+      ctx.state.set(key, undefined)
+      continue
+    }
+    // An ended conclusion may still have an open review; keep its QA context for a later reopen.
+    if (ticket.ended) continue
+    if (!follow) {
+      ctx.tickets.bindThread(ticket.id, thread, true, false)
+    }
+  }
   for (const ref of followedMergeRequests(ctx)) {
     if (round.signal?.aborted) return
+    if (retired.has(mergeRequestKey(ref))) continue
     await pollMergeRequest(ctx, file, ref, round)
   }
 }
@@ -530,7 +564,7 @@ async function pollMergeRequest(ctx: MergeContext, file: YunxiaoFile, ref: Merge
     await step(round, threadKey, 'close', async () => { ctx.tickets.threadClosed(thread, outcome, change.endedAt ?? round.started) })
     return
   }
-  await step(round, threadKey, 'change', () => pollChange(ctx, ref, change, round))
+  await step(round, threadKey, 'change', () => pollChange(ctx, organization, ref, change, round))
   await step(round, threadKey, 'retarget', () => pollRetarget(ctx, file, ref, change, round))
   await step(round, threadKey, 'comments', () => pollComments(ctx, organization, ref, round))
   await step(round, threadKey, 'CI', () => pollChecks(ctx, organization, ref, change, round))
@@ -539,11 +573,12 @@ async function pollMergeRequest(ctx: MergeContext, file: YunxiaoFile, ref: Merge
  * Reports a new head commit or a conflict. The first read of a merge request records where it stands without reporting it:
  * the ticket opened the merge request and knows, so only a later commit or a conflict is news.
  */
-async function pollChange(ctx: MergeContext, ref: MergeRequestRef, change: MergeRequestState, round: MergeRound): Promise<void> {
+async function pollChange(ctx: MergeContext, organization: string, ref: MergeRequestRef, change: MergeRequestState, round: MergeRound): Promise<void> {
   const threadKey = mergeRequestKey(ref)
   const previous = ctx.state.get(KV.yunxiao.mr(threadKey))
   const moved = previous !== undefined && previous.head !== change.head
-  if (moved || change.conflict) await ctx.receive(mrChangeTrigger(ref, change, round.started))
+  const qa = ctx.state.get(KV.yunxiao.qaMr(organization, ref.repositoryId, ref.localId))
+  if (moved || change.conflict) await ctx.receive(mrChangeTrigger(ref, change, round.started, qa?.sourceBranch.replace(/-qa$/, '')))
   // The record follows the Trigger, so a Trigger the Engine refused is reported again by the next round rather than recorded
   // as seen. A conflict that stays is read again every round, and its Trigger ID makes that read a duplicate.
   ctx.state.set(KV.yunxiao.mr(threadKey), { head: change.head, fingerprint: previous?.fingerprint ?? '',
@@ -556,6 +591,10 @@ async function pollChange(ctx: MergeContext, ref: MergeRequestRef, change: Merge
  * (see `approverMoved`), so the worker is never asked to undo what a person decided.
  */
 async function pollRetarget(ctx: MergeContext, file: YunxiaoFile, ref: MergeRequestRef, change: MergeRequestState, round: MergeRound): Promise<void> {
+  if (ctx.tickets.open().some(ticket => {
+    const origin = ctx.triggers.get(ticket.origin.triggerId)
+    return origin && yunxiaoRef(origin).workitemId && (ticket.follows ?? []).some(follow => follow.thread === mergeRequestKey(ref))
+  })) return
   // A delivery to the trunk or to a feature branch is not the release rule's business: only a release branch can be moved.
   if (!releaseBranchDay(change.target, file.release)) return
   if (approverMoved(ctx, ref, mergeRequestKey(ref))) return
@@ -576,7 +615,7 @@ async function pollRetarget(ctx: MergeContext, file: YunxiaoFile, ref: MergeRequ
 function approverMoved(ctx: MergeContext, ref: MergeRequestRef, threadKey: string): boolean {
   const moved = (thread: string): boolean => ctx.state.get(KV.merge.mr(thread))?.state === 'retarget'
   // The merge request the approval was about carries the record itself, so it is never asked to move a second time.
-  if (moved(threadKey)) return true
+  if (moved(threadKey) || ctx.state.get(KV.merge.mr(threadKey))?.state === 'replaced') return true
   for (const ticket of ctx.tickets.open()) {
     if (!(ticket.follows ?? []).some(follow => follow.thread === threadKey)) continue
     // One decision covers the ticket's merge requests in this repository: the one the approver answered about, and the one the

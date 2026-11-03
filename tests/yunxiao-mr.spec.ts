@@ -56,6 +56,7 @@ const ticket = (id: string, threads: readonly string[]): Ticket => ({ id, title:
   follows: threads.map(thread => ({ thread, own: true, ends: false })), origin: { triggerId: `origin-${id}`, triggerIds: [] } })
 
 interface HostOptions {
+  triggers?: Record<string, Trigger>
   tickets?: Ticket[]
   /** Answers by the `devops` subcommand; a value that is an `Error` is thrown as the CLI's failure. */
   routes?: Record<string, unknown>
@@ -94,13 +95,23 @@ function host(options: HostOptions = {}) {
       set: <V>(key: Key<V>, value: V | undefined): void => { if (value === undefined) records.delete(key); else records.set(key, value) },
       keys: <V>(family: Family<V, never>): Key<V>[] => [...records.keys()].filter(key => key.startsWith(family.prefix)) as Key<V>[],
     },
+    triggers: { get: (id: string) => options.triggers?.[id], latest: () => undefined },
     tickets: {
       get: (id: string) => options.tickets?.find(item => item.id === id),
-      open: () => options.tickets ?? [],
+      open: () => (options.tickets ?? []).filter(ticket => !ticket.ended),
       ended: () => [],
       stop: () => {},
-      bindThread: () => {},
-      threadClosed: (thread: ThreadRef, outcome: 'merged' | 'closed', at: string) => { closed.push({ thread, outcome, at }) },
+      bindThread: vi.fn((id: string, thread: ThreadRef, own: boolean, ends = true) => {
+        const item = options.tickets?.find(ticket => ticket.id === id)
+        if (item) (item.follows ??= []).push({ thread: `${thread.source}:${thread.id}`, own, ends })
+      }),
+      threadClosed: (thread: ThreadRef, outcome: 'merged' | 'closed', at: string) => {
+        closed.push({ thread, outcome, at })
+        for (const item of options.tickets ?? []) {
+          const follow = item.follows?.find(follow => follow.thread === `${thread.source}:${thread.id}` && !follow.closed)
+          if (follow) follow.closed = { outcome, at }
+        }
+      },
     },
     receive,
   } satisfies MergeContext
@@ -493,6 +504,14 @@ describe('merge request re-targeting', () => {
     // Both merge requests were still read.
     expect(h.calls.filter(argv => argv[1] === 'codeup-get-change-request')).toHaveLength(2)
   })
+  it('skips a superseded merge request without inheriting its expired release for the replacement', async () => {
+    const REPLACEMENT = 'yunxiao:mr:repo-1:15'
+    const h = host({ tickets: [ticket('t-1', [THREAD, REPLACEMENT])],
+      state: { [KV.merge.mr(THREAD)]: { state: 'replaced', commit: FIRST, target: APPROVED } },
+      routes: released({ 'codeup-get-change-request': byLocalId({ targetBranch: PREVIOUS }) }) })
+    await pollMergeRequests(h.ctx, file, h.round)
+    expect(h.triggers().filter(trigger => trigger.meta.mrChange === 'retarget').map(trigger => trigger.meta.localId)).toEqual([15])
+  })
   it('still moves a merge request whose ticket the approver has not decided about', async () => {
     // One ticket's delivery was moved by the approver; another ticket's was not, in the same repository.
     const OTHER = 'yunxiao:mr:repo-1:16'
@@ -528,4 +547,193 @@ describe('merge request re-targeting', () => {
     expect(h.records.has(KV.yunxiao.mr('yunxiao:mr:repo-1:12'))).toBe(true)
     expect(h.triggers().filter(trigger => trigger.meta.mrChange === 'retarget').map(trigger => trigger.meta.repository)).toEqual(['repo-2'])
   })
+})
+
+it('binds a pending QA MR before merging, forwards its review once and never treats it as a release retarget', async () => {
+  const item = ticket('qa-ticket', [])
+  const origin: Trigger = { id: item.origin.triggerId, source: 'yunxiao', threads: [], actor: { source: 'yunxiao', id: 'user-1' },
+    human: true, at: '', text: '', meta: { workitemId: 'wi-1' } }
+  const h = host({ tickets: [item], triggers: { [item.origin.triggerId]: origin },
+    state: { [KV.yunxiao.qaMr('org-1', 'repo-1', 12)]: { ticketId: item.id, repository: 'repo-1', mergeRequest: 12,
+      sourceBranch: 'SIQB-4-qa', qaBranch: 'release/261102', commit: FIRST } },
+    routes: routes({ 'codeup-get-change-request': changeRequest({ sourceBranch: 'SIQB-4-qa', targetBranch: 'release/261102' }),
+      'codeup-list-merge-request-comments': commentList(comment({ content: '<p>请补充空名称用例后再合并</p>' })) }) })
+  await pollMergeRequests(h.ctx, file, h.round)
+  expect(h.ctx.tickets.bindThread).toHaveBeenCalledWith(item.id, mergeRequestThread('repo-1', 12), true, false)
+  expect(h.triggers()).toHaveLength(1)
+  expect(h.triggers()[0]).toMatchObject({ text: '请补充空名称用例后再合并', threads: [mergeRequestThread('repo-1', 12)] })
+  expect(issued(h.calls)).not.toContain('codeup-list-branches')
+  await pollMergeRequests(h.ctx, file, h.round)
+  expect(h.ctx.tickets.bindThread).toHaveBeenCalledTimes(1)
+  expect(h.triggers()).toHaveLength(1)
+  expect(h.round.failures).toEqual([])
+})
+
+it('removes QA MR indices belonging to unrelated tickets without binding or polling', async () => {
+  const item = ticket('ordinary-ticket', [])
+  const h = host({ tickets: [item], state: { [KV.yunxiao.qaMr('org-1', 'repo-1', 12)]: {
+    ticketId: item.id, repository: 'repo-1', mergeRequest: 12, sourceBranch: 'SIQB-4', qaBranch: 'qa', commit: FIRST } } })
+  await pollMergeRequests(h.ctx, file, h.round)
+  expect(h.ctx.tickets.bindThread).not.toHaveBeenCalled()
+  expect(h.calls).toEqual([])
+  expect(h.records.has(KV.yunxiao.qaMr('org-1', 'repo-1', 12))).toBe(false)
+})
+
+it.each(['SIQB-4', 'SIQB-4-qa'])('directs QA MR conflicts from %s to the QA-only branch without rewriting development', async sourceBranch => {
+  const item = ticket('qa-ticket', [])
+  const origin: Trigger = { id: item.origin.triggerId, source: 'yunxiao', threads: [], actor: { source: 'yunxiao', id: 'user-1' },
+    human: true, at: '', text: '', meta: { workitemId: 'wi-1' } }
+  const h = host({ tickets: [item], triggers: { [item.origin.triggerId]: origin },
+    state: { [KV.yunxiao.qaMr('org-1', 'repo-1', 12)]: { ticketId: item.id, repository: 'repo-1', mergeRequest: 12,
+      sourceBranch, qaBranch: 'release/qa', commit: FIRST } },
+    routes: routes({ 'codeup-get-change-request': changeRequest({ sourceBranch, targetBranch: 'release/qa', conflictCheckStatus: 'HAS_CONFLICT' }) }) })
+  await pollMergeRequests(h.ctx, file, h.round)
+  const conflict = h.triggers().find(trigger => trigger.meta.kind === 'mr-change')!
+  expect(conflict.text).toContain('Keep development branch SIQB-4 unchanged')
+  expect(conflict.text).toContain('QA-only SIQB-4-qa')
+  expect(conflict.text).toContain('integration_branch=SIQB-4-qa')
+  expect(conflict.text).not.toContain('SIQB-4-qa-qa')
+  expect(conflict.text).not.toContain('the source branch must be updated')
+  const ref = { repositoryId: 'repo-1', localId: 12 }, change = { ...mergeRequestOf(changeRequest({ targetBranch: 'release/qa', conflictCheckStatus: 'HAS_CONFLICT' }), ref), head: FIRST }
+  expect(conflict.id).not.toBe(mrChangeTrigger(ref, change, STARTED).id)
+  expect(conflict.id).toBe(mrChangeTrigger(ref, change, STARTED, 'SIQB-4').id)
+  expect(issued(h.calls)).not.toContain('codeup-list-branches')
+  expect(h.round.failures).toEqual([])
+})
+
+it('closes the superseded QA follow once, retains history and polls only its replacement', async () => {
+  const replacement = 'yunxiao:mr:repo-1:15'
+  const item = ticket('qa-ticket', [THREAD])
+  const origin: Trigger = { id: item.origin.triggerId, source: 'yunxiao', threads: [], actor: { source: 'yunxiao', id: 'user-1' },
+    human: true, at: '', text: '', meta: { workitemId: 'wi-1' } }
+  const h = host({ tickets: [item], triggers: { [item.origin.triggerId]: origin }, state: {
+    [KV.yunxiao.qaMr('org-1', 'repo-1', 12)]: { ticketId: item.id, repository: 'repo-1', mergeRequest: 12,
+      sourceBranch: 'SIQB-4', qaBranch: 'release/qa', commit: FIRST, superseded: true },
+    [KV.yunxiao.qaMr('org-1', 'repo-1', 15)]: { ticketId: item.id, repository: 'repo-1', mergeRequest: 15,
+      sourceBranch: 'SIQB-4-qa', qaBranch: 'release/qa', commit: SECOND },
+    [KV.yunxiao.mr(THREAD)]: { head: FIRST, fingerprint: 'prior-checks', commentAt: STARTED, revision: 2 },
+  }, routes: routes({ 'codeup-get-change-request': (argv: string[]) => {
+    expect(flag(argv, '--local-id')).toBe('15')
+    return changeRequest({ localId: 15, sourceBranch: 'SIQB-4-qa', targetBranch: 'release/qa' })
+  } }) })
+  const enumerated = vi.spyOn(h.ctx.state, 'keys')
+  await pollMergeRequests(h.ctx, file, h.round)
+  expect(h.records.has(KV.yunxiao.qaMr('org-1', 'repo-1', 12))).toBe(false)
+  await pollMergeRequests(h.ctx, file, h.round)
+  expect(enumerated.mock.results[1]!.value).not.toContain(KV.yunxiao.qaMr('org-1', 'repo-1', 12))
+  expect(item.follows?.find(follow => follow.thread === THREAD)).toMatchObject({ ends: false, closed: { at: STARTED, outcome: 'closed' } })
+  expect(item.follows?.find(follow => follow.thread === replacement)).toMatchObject({ ends: false })
+  expect(item.ended).toBeUndefined()
+  expect(h.closed).toEqual([{ thread: mergeRequestThread('repo-1', 12), outcome: 'closed', at: STARTED }])
+  expect(h.ctx.tickets.bindThread).toHaveBeenCalledOnce()
+  expect(h.ctx.tickets.bindThread).toHaveBeenCalledWith(item.id, mergeRequestThread('repo-1', 15), true, false)
+  expect(h.calls.every(argv => !argv.includes('--local-id') || flag(argv, '--local-id') === '15')).toBe(true)
+  expect(h.triggers()).toEqual([])
+  expect(h.record()).toEqual({ head: FIRST, fingerprint: 'prior-checks', commentAt: STARTED, revision: 2 })
+  expect(h.round.failures).toEqual([])
+})
+
+it('does not bind or poll a superseded QA MR that was never followed', async () => {
+  const item = ticket('qa-ticket', [])
+  const origin: Trigger = { id: item.origin.triggerId, source: 'yunxiao', threads: [], actor: { source: 'yunxiao', id: 'user-1' },
+    human: true, at: '', text: '', meta: { workitemId: 'wi-1' } }
+  const h = host({ tickets: [item], triggers: { [item.origin.triggerId]: origin }, state: {
+    [KV.yunxiao.qaMr('org-1', 'repo-1', 12)]: { ticketId: item.id, repository: 'repo-1', mergeRequest: 12,
+      sourceBranch: 'SIQB-4', qaBranch: 'release/qa', commit: FIRST, superseded: true },
+  } })
+  await pollMergeRequests(h.ctx, file, h.round)
+  expect(h.ctx.tickets.bindThread).not.toHaveBeenCalled()
+  expect(h.closed).toEqual([])
+  expect(h.calls).toEqual([])
+  expect(h.records.has(KV.yunxiao.qaMr('org-1', 'repo-1', 12))).toBe(false)
+})
+
+it('removes an orphan QA MR index without erasing its history or reading Codeup', async () => {
+  const mr = KV.yunxiao.qaMr('org-1', 'repo-1', 12), history = KV.yunxiao.mr(THREAD)
+  const prior = { head: FIRST, fingerprint: 'retained', commentAt: STARTED, revision: 2 }
+  const h = host({ state: { [mr]: { ticketId: 'missing', repository: 'repo-1', mergeRequest: 12,
+    sourceBranch: 'SIQB-4', qaBranch: 'release/qa', commit: FIRST }, [history]: prior } })
+  await pollMergeRequests(h.ctx, file, h.round)
+  expect(h.records.has(mr)).toBe(false)
+  expect(h.records.get(history)).toEqual(prior)
+  expect(h.calls).toEqual([])
+  expect(h.closed).toEqual([])
+})
+
+it.each(['closed', 'gone'])('removes a current QA index after its followed MR is %s', async state => {
+  const item = ticket('qa-ticket', [THREAD])
+  if (state === 'closed') item.follows![0]!.closed = { at: STARTED, outcome: 'merged' }
+  const origin: Trigger = { id: item.origin.triggerId, source: 'yunxiao', threads: [], actor: { source: 'yunxiao', id: 'user-1' },
+    human: true, at: '', text: '', meta: { workitemId: 'wi-1' } }
+  const mr = KV.yunxiao.qaMr('org-1', 'repo-1', 12)
+  const h = host({ tickets: [item], triggers: { [origin.id]: origin }, state: { [mr]: { ticketId: item.id, repository: 'repo-1',
+    mergeRequest: 12, sourceBranch: 'SIQB-4', qaBranch: 'release/qa', commit: FIRST },
+    ...state === 'gone' ? { [KV.yunxiao.mr(THREAD)]: { head: FIRST, fingerprint: '', commentAt: STARTED, revision: 0, gone: true } } : {},
+  } })
+  await pollMergeRequests(h.ctx, file, h.round)
+  expect(h.records.has(mr)).toBe(false)
+  if (state === 'closed') expect(item.follows![0]!.closed).toEqual({ at: STARTED, outcome: 'merged' })
+  else expect(h.record()?.gone).toBe(true)
+  expect(h.calls).toEqual([])
+  expect(h.closed).toEqual([])
+})
+
+it('retains an ended ticket QA index when its receipt names the MR without proving it closed', async () => {
+  const item = ticket('qa-ticket', [THREAD])
+  item.ended = { at: STARTED, by: 'executor', outcome: 'completed' }
+  const before = structuredClone(item)
+  const origin: Trigger = { id: item.origin.triggerId, source: 'yunxiao', threads: [], actor: { source: 'yunxiao', id: 'user-1' },
+    human: true, at: '', text: '', meta: { workitemId: 'wi-1' } }
+  const mr = KV.yunxiao.qaMr('org-1', 'repo-1', 12)
+  const h = host({ tickets: [item], triggers: { [origin.id]: origin }, state: {
+    [mr]: { ticketId: item.id, repository: 'repo-1', mergeRequest: 12, sourceBranch: 'SIQB-4', qaBranch: 'release/qa', commit: FIRST },
+    [KV.yunxiao.qa(item.id, 'repo-1')]: { repository: 'repo-1', mergeRequest: 12, pipelineId: '11', runId: '3', branch: 'SIQB-4',
+      commit: FIRST, qaBranch: 'release/qa', qaCommit: SECOND },
+  } })
+  await pollMergeRequests(h.ctx, file, h.round)
+  expect(h.records.has(mr)).toBe(true)
+  expect(h.records.has(KV.yunxiao.qa(item.id, 'repo-1'))).toBe(true)
+  expect(item).toEqual(before)
+  expect(h.calls).toEqual([])
+  expect(h.closed).toEqual([])
+})
+
+it('retains a pending QA review after a ticket ends and resumes it with QA conflict guidance', async () => {
+  const item = ticket('qa-ticket', [])
+  item.ended = { at: STARTED, by: 'executor', outcome: 'completed' }
+  const origin: Trigger = { id: item.origin.triggerId, source: 'yunxiao', threads: [], actor: { source: 'yunxiao', id: 'user-1' },
+    human: true, at: '', text: '', meta: { workitemId: 'wi-1' } }
+  const mr = KV.yunxiao.qaMr('org-1', 'repo-1', 12)
+  const h = host({ tickets: [item], triggers: { [origin.id]: origin }, state: { [mr]: { ticketId: item.id, repository: 'repo-1',
+    mergeRequest: 12, sourceBranch: 'SIQB-4', qaBranch: 'release/qa', commit: FIRST } }, routes: routes({
+      'codeup-get-change-request': changeRequest({ sourceBranch: 'SIQB-4', targetBranch: 'release/qa', conflictCheckStatus: 'HAS_CONFLICT' }),
+    }) })
+  await pollMergeRequests(h.ctx, file, h.round)
+  expect(h.records.has(mr)).toBe(true)
+  expect(h.calls).toEqual([])
+  expect(h.ctx.tickets.bindThread).not.toHaveBeenCalled()
+  delete item.ended
+  await pollMergeRequests(h.ctx, file, h.round)
+  expect(h.ctx.tickets.bindThread).toHaveBeenCalledWith(item.id, mergeRequestThread('repo-1', 12), true, false)
+  expect(h.triggers().some(trigger => trigger.text.includes('Keep development branch SIQB-4 unchanged'))).toBe(true)
+  expect(h.records.has(mr)).toBe(true)
+  expect(h.round.failures).toEqual([])
+})
+
+it('does not poll a just-retired QA MR from a stale ticket snapshot in the same round', async () => {
+  const item = ticket('qa-ticket', [THREAD]), stale = structuredClone(item)
+  const origin: Trigger = { id: item.origin.triggerId, source: 'yunxiao', threads: [], actor: { source: 'yunxiao', id: 'user-1' },
+    human: true, at: '', text: '', meta: { workitemId: 'wi-1' } }
+  const mr = KV.yunxiao.qaMr('org-1', 'repo-1', 12)
+  const h = host({ tickets: [item], triggers: { [origin.id]: origin }, state: { [mr]: { ticketId: item.id, repository: 'repo-1',
+    mergeRequest: 12, sourceBranch: 'SIQB-4', qaBranch: 'release/qa', commit: FIRST, superseded: true } } })
+  vi.spyOn(h.ctx.tickets, 'open').mockReturnValueOnce([stale]).mockImplementation(() => [item])
+  await pollMergeRequests(h.ctx, file, h.round)
+  expect(h.records.has(mr)).toBe(false)
+  expect(item.follows![0]!.closed).toBeDefined()
+  expect(stale.follows![0]!.closed).toBeUndefined()
+  expect(h.calls).toEqual([])
+  await pollMergeRequests(h.ctx, file, h.round)
+  expect(h.closed).toHaveLength(1)
+  expect(h.calls).toEqual([])
 })

@@ -55,6 +55,10 @@ describe('the Codeup implementation', () => {
     const ended = { ...ticket('automation-retry-scope-AXOAXO-6701'), id: 't1', channels: [{ source: 'feishu', thread: 'feishu:oc_1', address: { chatId: 'oc_1', messageId: 'om_1' } }] } as unknown as Ticket
     expect(codeup.endNotices(ended, '修一下')).toEqual([])
   })
+  it.each(['AXOAXO-6812', 'AXOAXO-6812-to-release-20261103'])('binds the work item serial branch %s', headRef => {
+    expect(codeup.claim({ ticket: ticket('another-ticket'), change: merge({ headRef }), serial: 'AXOAXO-6812' })).toEqual({ own: true })
+    expect(codeup.claim({ ticket: ticket('another-ticket'), change: merge({ headRef }), serial: 'AXOAXO-6813' })).toHaveProperty('refused')
+  })
 })
 
 describe('ticket branches and source changes', () => {

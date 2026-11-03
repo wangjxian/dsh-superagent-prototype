@@ -153,6 +153,21 @@ const denyPipeline = (): string => `echo ${shellQuote(PIPELINE_DENIED)} >&2; exi
 const lookupCommand = (argv: readonly string[], variable: string): string =>
   [...argv.slice(0, -1).map(shellQuote), `"$${variable}"`].join(' ')
 
+/** Development stays on the work item serial; conflict resolution uses its QA-only branch. */
+const WORKITEM_BRANCH_GUARD = [
+  'admit_workitem_branch() {',
+  '  workitem_expected=${DSH_SUPERAGENT_YUNXIAO_SERIAL:-}',
+  `  if ! printf '%s' "$workitem_expected" | grep -Eq '^[A-Za-z0-9]+-[0-9]+$'; then`,
+  '    echo "dsh-superagent: a yunxiao delivery needs a valid work item serial" >&2; return 1',
+  '  fi',
+  '  case "$1" in',
+  '    "$workitem_expected"|"$workitem_expected"-qa) return 0 ;;',
+  '  esac',
+  '  echo "dsh-superagent: this yunxiao work item must use $workitem_expected (or its QA-only $workitem_expected-qa branch), not $1" >&2',
+  '  return 1',
+  '}',
+].join('\n')
+
 /**
  * The body of the workers' `aliyun` shim: it reads the keychain token into its own shell, admits only the subcommands a worker
  * may run, and execs the real CLI, so the token reaches that one process and no other.
@@ -231,7 +246,10 @@ function aliyunShim(stateDir: string, cli: string, keychain: string, organizatio
     // An update changes only a merge request's title or description, so it names no branch to check.
     '  codeup-update-change-request) ;;',
     '  codeup-create-change-request)',
-    // A worker delivers a bugfix/ or feat/ branch; a merge request from release or master is the host's business.
+    '    if [ -n "${DSH_SUPERAGENT_YUNXIAO_WORKITEM:-}${DSH_SUPERAGENT_YUNXIAO_SERIAL:-}" ]; then',
+    `      ${fail('dsh-superagent: Use orchestrator_qa_integrate to merge the tested work-item branch into its fixed QA branch, directly or via MR')}`,
+    '    fi',
+    // Non-work-item tickets keep the team's bugfix/feat convention.
     '    branch=',
     '    expect=',
     '    for arg in "$@"; do',
@@ -264,6 +282,9 @@ function aliyunShim(stateDir: string, cli: string, keychain: string, organizatio
     '    done',
     '    ;;',
     '  flow-create-pipeline-run|flow-retry-pipeline-job-run|flow-rerun-pipeline-job-run)',
+    '    if [ -n "${DSH_SUPERAGENT_YUNXIAO_WORKITEM:-}${DSH_SUPERAGENT_YUNXIAO_SERIAL:-}" ]; then',
+    `      ${fail('dsh-superagent: use orchestrator_qa_integrate to merge tested code into the fixed QA branch and observe its pipeline')}`,
+    '    fi',
     // The pipeline's name decides whether a worker may run it, so the shim reads it before the run starts; no name, no run.
     `    pipeline_id=$(argument ${shellQuote(pipelineIdFlag)} "$@") || { ${denyPipeline()}; }`,
     `    json=$("$cli" ${lookupPipeline} 2>/dev/null) || json=`,
@@ -276,16 +297,26 @@ function aliyunShim(stateDir: string, cli: string, keychain: string, organizatio
   ].join('\n')
 }
 
-/** The pre-push hook: only the branches a ticket delivers may be pushed, and no branch may be deleted. */
+/** Worker pushes are limited to delivery branches and must preserve their existing history. */
 const PRE_PUSH = [
-  '# Only the branches a ticket delivers may be pushed, and no branch may be deleted; the host pushes release branches itself.',
+  '# Worker branch checks prevent mistakes; server branch protection is the security boundary.',
+  WORKITEM_BRANCH_GUARD,
   'while read local_ref local_sha remote_ref remote_sha; do',
+  '  if [ -n "${DSH_SUPERAGENT_YUNXIAO_WORKITEM:-}${DSH_SUPERAGENT_YUNXIAO_SERIAL:-}" ]; then',
+  '    admit_workitem_branch "${remote_ref#refs/heads/}" || exit 1',
+  '    case "$remote_ref" in refs/heads/*) ;; *) echo "dsh-superagent: a worker may only push branches" >&2; exit 1 ;; esac',
+  '  else',
   '  case "$remote_ref" in',
   '    refs/heads/bugfix/*|refs/heads/feat/*) ;;',
   '    *) echo "dsh-superagent: a worker may only push bugfix/ and feat/ branches, not $remote_ref" >&2; exit 1 ;;',
   '  esac',
+  '  fi',
   '  case "$local_sha" in',
   '    0000000000000000000000000000000000000000) echo "dsh-superagent: a worker may not delete $remote_ref" >&2; exit 1 ;;',
+  '  esac',
+  '  case "$remote_sha" in',
+  '    0000000000000000000000000000000000000000) ;;',
+  '    *) git merge-base --is-ancestor "$remote_sha" "$local_sha" || { echo "dsh-superagent: non-fast-forward push refused for $remote_ref; fetch and preserve its history" >&2; exit 1; } ;;',
   '  esac',
   'done',
   'exit 0',

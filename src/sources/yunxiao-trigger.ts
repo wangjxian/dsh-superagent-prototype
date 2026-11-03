@@ -215,21 +215,35 @@ export function relationOf(raw: unknown, self: string): WorkitemRelation | undef
   return { workitemId, type: stringOf(first(record, RELATION_TYPE)) ?? stringOf(first(embedded, RELATION_TYPE)) ?? '' }
 }
 
+/** How the Source hands a work item to the agent, beyond the work item itself. */
+export interface WorkitemTriggerOptions {
+  /**
+   * Where the ticket's own messages go: the work item unless the Source names the approver's direct message, so a person
+   * hears about the work item in Feishu instead of on a colleague's work item.
+   */
+  channel?: ChannelRef
+  /**
+   * True for a triage project, whose assignment is a candidate rather than a request: the Trigger names the work item and
+   * leaves the decision to the assessment, which asks a person when the work turns out to need one.
+   */
+  triage?: boolean
+}
 /**
- * Builds the trigger for a work item assigned to the agent's account, which is the request itself.
+ * Builds the trigger for a work item assigned to the agent's account.
+ * A direct project's assignment is the request itself: the Trigger is addressed to the agent. A triage project's is not, so
+ * the Policy admits it as an inferred candidate and the assessment decides what happens.
  * `agent` names that account: the assignment counts as a person's request even though the assignee is the account the
  * agent acts as, so it does not change `human`.
- * `channel` is where the ticket's own messages go, the work item unless the Source names the approver's direct message: a
- * person then hears about the work item in Feishu instead of on a colleague's work item.
  */
 export function workitemTrigger(item: Workitem, actor: string, cycle: number, agent: string,
-  channel: ChannelRef = workitemChannel(item.id)): Trigger {
+  { channel = workitemChannel(item.id), triage = false }: WorkitemTriggerOptions = {}): Trigger {
   return { id: workitemTriggerId(item.id, cycle), source: SOURCE, threads: [workitemThread(item.id)],
-    actor: { source: SOURCE, id: actor }, human: true, addressed: 'mention',
+    actor: { source: SOURCE, id: actor }, human: true, ...(triage ? {} : { addressed: 'mention' as const }),
     at: item.modifiedAt || new Date().toISOString(),
     text: [[item.serial, item.title].filter(Boolean).join(' '), item.description].filter(Boolean).join('\n\n'),
     channel, url: item.url,
-    meta: { workitemId: item.id, serial: item.serial, category: item.category, projectId: item.projectId, status: item.status, cycle } }
+    meta: { workitemId: item.id, serial: item.serial, category: item.category, projectId: item.projectId, status: item.status, cycle,
+      ...(triage ? { triage: true } : {}) } }
 }
 /**
  * Builds the trigger for a comment on a work item, or returns undefined for one this Source wrote itself: the agent

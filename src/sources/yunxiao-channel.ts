@@ -1,4 +1,4 @@
-/** Yunxiao outbound channel: writes a work item's comments as the agent account and links a work item to its page. */
+/** Yunxiao outbound channel: work-item and merge-request comments written as the agent account. */
 import { z } from 'zod'
 import type { OutboundMessage } from '../core/index.ts'
 import { CliError } from '../infra/commands.ts'
@@ -6,6 +6,7 @@ import { AGENT_COMMENT, YUNXIAO } from '../infra/yunxiao.ts'
 import type { SourceContext } from './host.ts'
 import type { ChannelLink, ChannelLinks } from './kind.ts'
 import { workitemUrl } from './yunxiao-trigger.ts'
+import { latestPatchSet, mergeCommentsOf } from './yunxiao-mr.ts'
 
 /** Work-item ids are alphanumeric in projex (`9642d6f9acc4e415adea201cc1`); an address of another shape names no work item we may write to. */
 const WORKITEM_ID = /^[A-Za-z0-9]+$/
@@ -46,17 +47,33 @@ function carries(value: unknown, marker: string): boolean {
  */
 export async function sendYunxiao(host: Pick<SourceContext, 'commands'>, message: OutboundMessage): Promise<'sent' | 'gone'> {
   const { commands } = host
-  const id = workitemIdOf(message.channel.address)
+  const address = message.channel.address
+  const mr = address.repository === undefined ? undefined : z.object({ repository: z.string().min(1),
+    localId: z.coerce.number().int().positive(), parentComment: z.string().min(1).optional() }).parse(address)
+  const id = mr ? '' : workitemIdOf(address)
   // The organization comes from the Codeup account setup verified, the only one this deployment may write as; the
   // receiving-rule file names the same organization, and the Source reports a file that names another one.
   const organization = commands.deployment.codeup?.organization
   if (!organization) throw new Error('The yunxiao Source needs the Codeup account\'s organization')
+  if (mr && !commands.deployment.codeup?.repositories.some(repository => repository.id === mr.repository)) {
+    throw new Error('The merge request repository is not in the Codeup workspace')
+  }
   const marker = `<!-- dsh-superagent:${message.id} -->`
   try {
     // A failed read is a failed send: writing the comment without knowing whether it already exists could duplicate it.
-    const comments = await commands.aliyun(z.unknown(), YUNXIAO.workitemComments(organization, id))
+    const comments = await commands.aliyun(z.unknown(), mr ? YUNXIAO.changeRequestComments(organization, mr.repository, mr.localId)
+      : YUNXIAO.workitemComments(organization, id))
     if (carries(comments, marker)) return 'sent'
-    await commands.aliyun(YUNXIAO.createWorkitemComment(organization, id, `${message.text}\n\n${marker}\n${AGENT_COMMENT}`))
+    const content = `${message.text}\n\n${marker}\n${AGENT_COMMENT}`
+    if (mr) {
+      const parent = mr.parentComment ? mergeCommentsOf(comments).find(comment => comment.id === mr.parentComment) : undefined
+      if (mr.parentComment && !parent) throw new Error('The merge request parent comment could not be found')
+      const inline = parent?.inline
+      const patch = parent ? parent.patchSet ?? inline?.toPatchSet
+        : latestPatchSet(await commands.aliyun(z.unknown(), YUNXIAO.patchSets(organization, mr.repository, mr.localId)))?.id
+      if (!patch) throw new Error('The merge request has no source patch set to comment on')
+      await commands.aliyun(YUNXIAO.createChangeRequestComment(organization, mr.repository, mr.localId, patch, content, mr.parentComment, inline))
+    } else await commands.aliyun(YUNXIAO.createWorkitemComment(organization, id, content))
   } catch (error) {
     if (workitemGone(error)) return 'gone'
     throw error

@@ -38,6 +38,8 @@ export const tokenArgv = (cli: string, args: readonly string[]): string[] => ['s
 export const BRANCH_PAGE_SIZE = 100
 /** The merge type a merge request merges with when the receiving rules name none: a merge commit, Codeup's own default. */
 export const DEFAULT_MERGE_TYPE = 'no-fast-forward'
+/** The original comparison and line a reply to an inline review comment must retain. */
+export interface InlineComment { filePath: string; lineNumber: number; fromPatchSet: string; toPatchSet: string }
 /** Subcommands dsh-superagent calls, by purpose, with the flags this installation expects. */
 export const YUNXIAO = {
   /** The account the token belongs to. */
@@ -95,10 +97,23 @@ export const YUNXIAO = {
   /** Opens a merge request. */
   createChangeRequest: (organization: string, repositoryId: string) =>
     ['devops', 'codeup-create-change-request', '--organization-id', organization, '--repository-id', repositoryId],
+  qaChangeRequest: (organization: string, repositoryId: string, source: string, target: string) =>
+    ['devops', 'codeup-create-change-request', '--organization-id', organization, '--repository-id', repositoryId,
+      '--source-project-id', repositoryId, '--target-project-id', repositoryId, '--source-branch', source, '--target-branch', target,
+      '--title', `${source} → ${target} QA integration`],
+  openChangeRequests: (organization: string, repositoryId: string, page: number) =>
+    ['devops', 'codeup-list-change-requests', '--organization-id', organization, '--project-ids', repositoryId,
+      '--state', 'opened', '--page', String(page), '--per-page', '100'],
+  mergeQaChangeRequest: (organization: string, repositoryId: string, localId: number) =>
+    ['devops', 'codeup-merge-change-request', '--organization-id', organization, '--repository-id', repositoryId,
+      '--local-id', String(localId), '--merge-type', 'no-fast-forward', '--remove-source-branch', 'false'],
   /** Writes a comment on a merge request. */
-  createChangeRequestComment: (organization: string, repositoryId: string, localId: number, content: string) =>
+  createChangeRequestComment: (organization: string, repositoryId: string, localId: number, patchSet: string, content: string, parent?: string, inline?: InlineComment) =>
     ['devops', 'codeup-create-change-request-comment', '--organization-id', organization, '--repository-id', repositoryId,
-      '--local-id', String(localId), '--content', content],
+      '--local-id', String(localId), '--comment-type', inline ? 'INLINE_COMMENT' : 'GLOBAL_COMMENT', '--draft', 'false', '--resolved', 'false',
+      '--patchset-biz-id', patchSet, '--content', content, ...parent ? ['--parent-comment-biz-id', parent] : [],
+      ...inline ? ['--file-path', inline.filePath, '--line-number', String(inline.lineNumber),
+        '--from-patchset-biz-id', inline.fromPatchSet, '--to-patchset-biz-id', inline.toPatchSet] : []],
   /** Every comment of a merge request in one report. */
   changeRequestComments: (organization: string, repositoryId: string, localId: number) =>
     ['devops', 'codeup-list-merge-request-comments', '--organization-id', organization, '--repository-id', repositoryId, '--local-id', String(localId)],
@@ -119,8 +134,11 @@ export const YUNXIAO = {
   pipeline: (organization: string, pipelineId: string) =>
     ['devops', 'flow-get-pipeline', '--organization-id', organization, '--pipeline-id', pipelineId],
   /** The runs of a pipeline, newest first, which is how a worker finds the run its change started. */
-  pipelineRuns: (organization: string, pipelineId: string) =>
-    ['devops', 'flow-list-pipeline-runs', '--organization-id', organization, '--pipeline-id', pipelineId],
+  pipelineRuns: (organization: string, pipelineId: string, status?: 'RUNNING') =>
+    ['devops', 'flow-list-pipeline-runs', '--organization-id', organization, '--pipeline-id', pipelineId,
+      ...status ? ['--status', status, '--per-page', '1'] : []],
+  latestPipelineRun: (organization: string, pipelineId: string) =>
+    ['devops', 'flow-get-latest-pipeline-run', '--organization-id', organization, '--pipeline-id', pipelineId],
   /** One run with its jobs and their states. */
   pipelineRun: (organization: string, pipelineId: string, runId: string) =>
     ['devops', 'flow-get-pipeline-run', '--organization-id', organization, '--pipeline-id', pipelineId, '--pipeline-run-id', runId],
@@ -128,8 +146,9 @@ export const YUNXIAO = {
   pipelineJobLog: (organization: string, pipelineId: string, runId: string, jobId: string) =>
     ['devops', 'flow-get-pipeline-job-run-log', '--organization-id', organization, '--pipeline-id', pipelineId, '--pipeline-run-id', runId, '--job-id', jobId],
   /** Starts a run of a pipeline. */
-  createPipelineRun: (organization: string, pipelineId: string) =>
-    ['devops', 'flow-create-pipeline-run', '--organization-id', organization, '--pipeline-id', pipelineId],
+  createPipelineRun: (organization: string, pipelineId: string, params?: Record<string, unknown>) =>
+    ['devops', 'flow-create-pipeline-run', '--organization-id', organization, '--pipeline-id', pipelineId,
+      ...params ? ['--params', JSON.stringify(params)] : []],
   /** Retries a failed task of a run. */
   retryPipelineJob: (organization: string, pipelineId: string, runId: string, jobId: string) =>
     ['devops', 'flow-retry-pipeline-job-run', '--organization-id', organization, '--pipeline-id', pipelineId, '--pipeline-run-id', runId, '--job-id', jobId],

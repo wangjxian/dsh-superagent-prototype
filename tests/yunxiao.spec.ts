@@ -7,11 +7,13 @@ import configs from '../tsdown.config.ts'
 import type { ReceiveResult, Thread, Ticket, Trigger } from '../src/core/index.ts'
 import { KV } from '../src/kv.ts'
 import type { Deployment } from '../src/deployment.ts'
-import { CliError, type Commands } from '../src/infra/commands.ts'
+import type { Commands } from '../src/infra/commands.ts'
 import { AGENT_COMMENT } from '../src/infra/yunxiao.ts'
 import { sourceContextOf, type SourceContextDeps } from '../src/app/source-context.ts'
+import { Store } from '../src/app/store.ts'
+import { verifyQa } from '../src/app/qa.ts'
 import { HealthBoard } from '../src/infra/health.ts'
-import { SettingsSchema } from '../src/policy.ts'
+import { SettingsSchema, settingsPolicy } from '../src/policy.ts'
 import { HEALTH_TEXT, type SourceContext } from '../src/sources/host.ts'
 import { SourceRegistry } from '../src/sources/registry.ts'
 import { apply as applyYunxiao, currentRules, inject, name as pluginName, pollRound, yunxiaoKind } from '../src/sources/yunxiao.ts'
@@ -68,10 +70,8 @@ const APPROVED_RULES = `${RULES}approver:
 pipelines:
   allowPrefixes: ["qa-", "pre-", "hotfix-"]
 `
-/** A triage project: work starts only after the approver answers, and without one the Source starts it directly. */
-const TRIAGE_NO_APPROVER = RULES.replace('intake: direct', 'intake: triage')
-/** The same triage project with an approver to ask. */
-const TRIAGE_RULES = `${TRIAGE_NO_APPROVER}approver:
+/** A triage project with an approver: its assignment is a candidate for the assessment, not a request. */
+const TRIAGE_RULES = `${RULES.replace('intake: direct', 'intake: triage')}approver:
   feishuOpenId: "ou_approver"
 `
 const dirs: string[] = []
@@ -103,7 +103,7 @@ const openTicket = (id: string, workitemId: string): Ticket => ({ id, title: id,
 const endedTicket = (id: string, workitemId: string): Ticket => ({ ...openTicket(id, workitemId),
   ended: { at: new Date().toISOString(), by: 'executor', outcome: 'completed' },
   assignments: [{ id: `a-${id}`, state: 'ended', createdAt: '', report: { state: 'ready', summary: 'done', at: new Date().toISOString(),
-    result: { verification: '在 PRE 上复现并验证通过' } } }] })
+    result: { verification: '在 QA 上复现并验证通过', qa: { repository: 'repo-1', pipeline_id: '11', run_id: '2', main_flow_passed: true, evidence: 'QA main flow passed', verified: true } } } }] })
 /** A subscribed Thread of a work item, whose comments the Source keeps reading. */
 const workitemThread = (workitemId: string): Thread => ({ key: `yunxiao:wi:${workitemId}`, ref: { source: 'yunxiao', id: `wi:${workitemId}` },
   createdAt: new Date().toISOString(), subscriptions: ['t-1'], correlated: [], pending: [], meta: {} })
@@ -140,17 +140,9 @@ function host(options: HostOptions = {}) {
   // The table stays the caller's object, so a test can change a subcommand's answer between rounds.
   const routes: Record<string, unknown> = options.routes ?? {}
   const calls: string[][] = []
-  const larkCalls: string[][] = []
   const commands = {
     deployment,
     withSignal: () => commands,
-    // The Feishu bot's CLI, as `createFeishuDirect` calls it: a started direct message answers with its message id.
-    async lark(args: string[]): Promise<unknown> {
-      larkCalls.push([...args])
-      const answer = routes['lark'] ?? { message_id: `om_${larkCalls.length}` }
-      if (answer instanceof Error) throw answer
-      return answer
-    },
     // Both `aliyun(argv)` and `aliyun(schema, argv)` land here; the Source uses the schema form only to validate the envelope.
     async aliyun(first: unknown, second?: readonly string[]): Promise<unknown> {
       const argv = (Array.isArray(first) ? first : second ?? []) as string[]
@@ -199,7 +191,7 @@ function host(options: HostOptions = {}) {
   } satisfies SourceContextDeps
   const orchestrator = { sources, context: (kind: { kind: string; health: readonly string[] }) => sourceContextOf(deps, kind) }
   return {
-    ctx: sourceContextOf(deps, yunxiaoKind), board, receive, stopTicket, calls, larkCalls, state, configPath, writeRules, deployment,
+    ctx: sourceContextOf(deps, yunxiaoKind), board, receive, stopTicket, calls, state, configPath, writeRules, deployment,
     sources, stateDir, received,
     /** Runs the plugin entry, as DSH mounts it, and returns a stop that disposes what it registered. */
     plugin() {
@@ -263,7 +255,7 @@ describe('yunxiao kind', () => {
     expect(policy.schema.parse({})).toEqual({ allowed: [{ id: AGENT }] })
     expect(policy.rows!({})).toEqual([
       { id: 'proj-1', label: 'proj-1', note: { zh: '先评估', en: 'Assessed first' },
-        cells: { listedUnaddressed: false, unlistedAddressed: false, unlistedUnaddressed: false } },
+        cells: { listedUnaddressed: true, unlistedAddressed: false, unlistedUnaddressed: false } },
       { id: 'proj-2', label: 'proj-2', note: { zh: '直接开工', en: 'Starts directly' },
         cells: { listedUnaddressed: false, unlistedAddressed: false, unlistedUnaddressed: false } },
     ])
@@ -273,6 +265,9 @@ describe('yunxiao kind', () => {
     expect(environment.variables.map(variable => variable.key)).toEqual(['DSH_SUPERAGENT_YUNXIAO_WORKITEM', 'DSH_SUPERAGENT_YUNXIAO_SERIAL',
       'DSH_SUPERAGENT_YUNXIAO_URL', 'DSH_SUPERAGENT_YUNXIAO_CATEGORY'])
     for (const variable of environment.variables) expect(variable.description.zh && variable.description.en).toBeTruthy()
+    const category = environment.variables.find(variable => variable.key === 'DSH_SUPERAGENT_YUNXIAO_CATEGORY')!.description
+    expect(category.en).toContain('both use the bare work-item serial as development branch')
+    expect(category.zh).not.toMatch(/bugfix\/|feat\//)
     const deployment = testDeployment()
     const config = yunxiaoKind.schema.parse({})
     const trigger: Trigger = { id: 'x', source: 'yunxiao', threads: [], actor: { source: 'yunxiao', id: AGENT }, human: true, at: '',
@@ -380,6 +375,86 @@ describe('yunxiao polling', () => {
     await pollRound(h.ctx)
     expect(h.receive).toHaveBeenCalledTimes(2)
   })
+  it('invalidates prior-cycle QA acceptance before resuming unchanged work and preserves new evidence on ordinary polls/comments', async () => {
+    const ended = endedTicket('t-1', 'wi-1'), historical = structuredClone(ended.assignments[0]!.report)
+    const routes: Record<string, unknown> = { 'projex-search-workitems': search(workitem({ status: '30' })) }
+    const h = host({ routes, tickets: { ended: [ended] }, threads: [workitemThread('wi-1')], triggers: { 'origin-wi-1': originTrigger('wi-1') } })
+    const path = join(h.stateDir, 'acceptance.sqlite'), cache = new Store(path), commit = 'a'.repeat(40)
+    h.ctx.state = { get: key => cache.get(key), set: (key, value) => { if (value === undefined) cache.delete(key); else cache.set(key, value) }, keys: family => cache.keys(family) }
+    h.ctx.atomic = work => cache.atomic(work)
+    const plan = { environment: 'http://qa.example.test', tested: true, projects: [{ repository: 'repo-1', pipelineId: '11',
+      directory: '/work/app', command: 'unit', qaBranch: 'release/qa', commit, output: 'OK' }] }
+    const acceptance = { environment: plan.environment, command: 'QA test', output: 'old acceptance', at: '', projects: [
+      { repository: 'repo-1', pipelineId: '11', runId: '2', commit, qaBranch: 'release/qa', qaCommit: 'b'.repeat(40) },
+    ] }
+    const receipt = { repository: 'repo-1', pipelineId: '11', runId: '2', branch: 'AXOAXO-1', commit, qaBranch: 'release/qa', qaCommit: 'b'.repeat(40) }
+    const pending = { ticketId: 't-1', repository: 'repo-1', mergeRequest: 9, sourceBranch: 'AXOAXO-1', qaBranch: 'release/qa', commit }
+    try {
+      cache.set(KV.yunxiao.workitem('wi-1'), { cycle: 0, status: '29', assignee: AGENT, commentAt: '' })
+      cache.set(KV.yunxiao.writeback('t-1'), { at: ended.ended!.at, ended: ended.ended!.at })
+      cache.set(KV.yunxiao.qaPlan('t-1'), plan)
+      cache.set(KV.yunxiao.qaTest('t-1'), acceptance)
+      cache.set(KV.yunxiao.qa('t-1', 'repo-1'), receipt)
+      cache.set(KV.yunxiao.qaMr('org-1', 'repo-1', 9), pending)
+      h.receive.mockImplementation(trigger => {
+        if (trigger.id === workitemTriggerId('wi-1', 1)) {
+          expect(cache.get(KV.yunxiao.qaPlan('t-1'))).toBeUndefined()
+          expect(cache.get(KV.yunxiao.qaTest('t-1'))).toBeUndefined()
+        }
+        h.received.set(trigger.id, trigger)
+        return 'stored'
+      })
+      await pollRound(h.ctx)
+      expect(cache.get(KV.yunxiao.workitem('wi-1'))).toMatchObject({ cycle: 1 })
+      expect(cache.get(KV.yunxiao.qa('t-1', 'repo-1'))).toEqual(receipt)
+      expect(cache.get(KV.yunxiao.qaMr('org-1', 'repo-1', 9))).toEqual(pending)
+      expect(ended.assignments[0]!.report).toEqual(historical)
+      await expect(verifyQa({ commands: h.ctx.commands, store: cache }, 't-1', historical!.result ?? {})).rejects.toThrow('Run local unit tests for ALL')
+      const reopened = new Store(path)
+      try {
+        expect(reopened.get(KV.yunxiao.qaPlan('t-1'))).toBeUndefined()
+        expect(reopened.get(KV.yunxiao.qaTest('t-1'))).toBeUndefined()
+      } finally { reopened.close() }
+      const fresh = { ...acceptance, output: 'new-cycle acceptance' }
+      cache.set(KV.yunxiao.qaPlan('t-1'), plan)
+      cache.set(KV.yunxiao.qaTest('t-1'), fresh)
+      await pollRound(h.ctx)
+      routes['projex-list-workitem-comments'] = comments(comment())
+      routes['projex-get-workitem'] = workitem({ status: '30' })
+      await pollRound(h.ctx)
+      expect(cache.get(KV.yunxiao.qaPlan('t-1'))).toEqual(plan)
+      expect(cache.get(KV.yunxiao.qaTest('t-1'))).toEqual(fresh)
+    } finally { cache.close() }
+  })
+  it('does not invalidate new QA evidence when an already accepted cycle is retried', async () => {
+    const ticket = endedTicket('t-1', 'wi-1'), routes: Record<string, unknown> = { 'projex-search-workitems': search(workitem({ status: '30' })) }
+    const h = host({ routes, tickets: { ended: [ticket] }, threads: [workitemThread('wi-1')], triggers: { 'origin-wi-1': originTrigger('wi-1') } })
+    h.state.set(KV.yunxiao.workitem('wi-1'), { cycle: 0, status: '29', assignee: AGENT, commentAt: '' })
+    h.state.set(KV.yunxiao.writeback('t-1'), { at: ticket.ended!.at, ended: ticket.ended!.at })
+    await pollRound(h.ctx)
+    const plan = { tested: true, evidence: 'new preparation' }, test = { output: 'new acceptance' }
+    h.state.set(KV.yunxiao.qaPlan('t-1'), plan)
+    h.state.set(KV.yunxiao.qaTest('t-1'), test)
+    // A failed intake checkpoint may leave the old source state after the Engine already accepted the deterministic trigger.
+    h.state.set(KV.yunxiao.workitem('wi-1'), { cycle: 0, status: '29', assignee: AGENT, commentAt: '' })
+    await pollRound(h.ctx)
+    expect(h.receive.mock.results.at(-1)!.value).toBe('duplicate')
+    expect(h.state.get(KV.yunxiao.qaPlan('t-1'))).toEqual(plan)
+    expect(h.state.get(KV.yunxiao.qaTest('t-1'))).toEqual(test)
+  })
+  it('does not invalidate a different work item that only subscribes to the reopened thread', async () => {
+    const other = endedTicket('other', 'wi-other'), thread = { ...workitemThread('wi-1'), subscriptions: ['other'] }
+    const h = host({ routes: { 'projex-search-workitems': search(workitem({ status: '30' })) }, tickets: { ended: [other] },
+      threads: [thread], triggers: { 'origin-wi-other': originTrigger('wi-other') } })
+    h.state.set(KV.yunxiao.workitem('wi-1'), { cycle: 0, status: '29', assignee: AGENT, commentAt: '' })
+    h.state.set(KV.yunxiao.writeback('other'), { at: other.ended!.at, ended: other.ended!.at })
+    const plan = { tested: true }, test = { output: 'unrelated acceptance' }
+    h.state.set(KV.yunxiao.qaPlan('other'), plan)
+    h.state.set(KV.yunxiao.qaTest('other'), test)
+    await pollRound(h.ctx)
+    expect(h.state.get(KV.yunxiao.qaPlan('other'))).toEqual(plan)
+    expect(h.state.get(KV.yunxiao.qaTest('other'))).toEqual(test)
+  })
   it('records a work item assigned to someone else, and one outside the receiving statuses, without receiving it', async () => {
     const routes: Record<string, unknown> = { 'projex-search-workitems': search(workitem({ assignedTo: { id: 'user-2' } })) }
     const h = host({ routes })
@@ -475,7 +550,7 @@ describe('yunxiao polling', () => {
     expect(writes).toHaveLength(1)
     const content = flag(writes[0]!, '--content')
     expect(content.startsWith('已修复')).toBe(true)
-    expect(content).toContain('验证证据：在 PRE 上复现并验证通过')
+    expect(content).toContain('验证证据：在 QA 上复现并验证通过')
     expect(content).toContain(AGENT_COMMENT)
     const moves = h.calls.filter(argv => argv[1] === 'projex-update-workitem')
     expect(JSON.parse(flag(moves[0]!, '--biz-body'))).toEqual({ status: '29' })
@@ -597,150 +672,50 @@ describe('yunxiao status moves and reassignment', () => {
     expect(h.board.all.yunxiao).toMatchObject({ state: 'error', detail: expect.stringContaining('worker-pipelines') })
   })
 })
-describe('yunxiao triage', () => {
-  it('asks the approver before starting a triage project\'s work item, and starts it when the answer is go', async () => {
-    const h = host({ rules: TRIAGE_RULES, routes: { 'projex-search-workitems': search(workitem()),
-      'projex-get-workitem': { workitem: workitem() } } })
-    await pollRound(h.ctx)
-    // Nothing starts before the person answered.
-    expect(h.receive).not.toHaveBeenCalled()
-    expect(h.larkCalls).toHaveLength(1)
-    const question = h.larkCalls[0]!
-    expect(question.slice(0, 5)).toEqual(['im', '+messages-send', '--user-id', 'ou_approver', '--markdown'])
-    const text = flag(question, '--markdown')
-    expect(text).toContain('【开工确认】 AXOAXO-1 Login fails')
-    expect(text).toContain('https://devops.aliyun.com/projex/workitem/wi-1')
-    expect(text).toContain('回复「开工」开始处理；回复「不做」跳过；其他文字视为补充信息并开工。')
-    const asked = h.state.get(KV.yunxiao.triage('wi-1')) as { state: string; messageId: string; cycle: number }
-    expect(asked).toMatchObject({ state: 'asked', messageId: 'om_1', cycle: 0 })
-    // The host reads the answer through this record, which names the work item the question asks about.
-    expect(h.state.get(KV.merge.message('om_1'))).toMatchObject({ thread: '', ticketId: '', kind: 'triage', workitemId: 'wi-1' })
-    // The question waits for an answer rather than being asked again.
-    await pollRound(h.ctx)
-    expect(h.larkCalls).toHaveLength(1)
-    // The host records the answer; the Source starts the work from it, once.
-    h.state.set(KV.yunxiao.triage('wi-1'), { ...asked, state: 'go', answer: '开工' })
-    await pollRound(h.ctx)
-    expect(h.receive).toHaveBeenCalledOnce()
-    expect(h.receive.mock.calls[0]![0].channel).toMatchObject({ source: 'feishu', address: { openId: 'ou_approver' } })
-    expect(h.receive.mock.calls[0]![0].text).not.toContain('补充信息')
-    await pollRound(h.ctx)
-    expect(h.receive).toHaveBeenCalledOnce()
-  })
-  it('passes an answer that says more than go on to the worker', async () => {
-    const h = host({ rules: TRIAGE_RULES, routes: { 'projex-search-workitems': search(workitem()),
-      'projex-get-workitem': { workitem: workitem() } } })
-    await pollRound(h.ctx)
-    h.state.set(KV.yunxiao.triage('wi-1'), { state: 'go', answer: '顺便看下 Safari', at: '', cycle: 0 })
-    await pollRound(h.ctx)
-    expect(h.receive.mock.calls[0]![0].text).toContain('补充信息（审批人）：顺便看下 Safari')
-  })
-  it('starts nothing when the approver declines', async () => {
+describe('yunxiao triage projects', () => {
+  it('hands a triage project\'s assignment to the assessment instead of calling it a request', async () => {
     const h = host({ rules: TRIAGE_RULES, routes: { 'projex-search-workitems': search(workitem()) } })
     await pollRound(h.ctx)
-    h.state.set(KV.yunxiao.triage('wi-1'), { state: 'declined', answer: '不做', at: '', cycle: 0 })
-    await pollRound(h.ctx)
-    expect(h.receive).not.toHaveBeenCalled()
-  })
-  it('starts the work directly and says so when the rules name no approver', async () => {
-    const h = host({ rules: TRIAGE_NO_APPROVER, routes: { 'projex-search-workitems': search(workitem()) } })
-    await pollRound(h.ctx)
-    expect(h.larkCalls).toEqual([])
     expect(h.receive).toHaveBeenCalledOnce()
-    expect(h.board.all.yunxiao).toMatchObject({ state: 'error', detail: expect.stringContaining('approver.feishuOpenId') })
-    expect(h.state.get(KV.yunxiao.triage('wi-1'))).toBeUndefined()
+    const trigger = h.receive.mock.calls[0]![0]
+    // No address of its own: the Policy admits it as an inferred candidate, and the assessment decides whether a person
+    // has to confirm the work before it starts.
+    expect(trigger).not.toHaveProperty('addressed')
+    expect(trigger.meta).toMatchObject({ workitemId: 'wi-1', cycle: 0, triage: true })
+    expect(trigger).toMatchObject({ human: true, actor: { source: 'yunxiao', id: AGENT } })
+    // The approver still receives the ticket's own messages once the work starts.
+    expect(trigger.channel).toMatchObject({ source: 'feishu', address: { openId: 'ou_approver' } })
+    // The Source has to say it observed the work item itself: an unaddressed Trigger is only receivable when it did.
+    const scope = yunxiaoKind.scope!
+    const config = yunxiaoKind.schema.parse({})
+    expect(scope({ meta: { projectId: 'proj-1', triage: true } }, config)).toEqual({ listened: true, observed: true, row: 'proj-1' })
+    // A comment on the same project is no observed work item: it only follows an existing ticket up.
+    expect(scope({ meta: { projectId: 'proj-1' } }, config)).toEqual({ listened: true, observed: false, row: 'proj-1' })
   })
-  it('asks again when a new repair cycle starts', async () => {
-    const routes: Record<string, unknown> = { 'projex-search-workitems': search(workitem()), 'projex-get-workitem': { workitem: workitem() } }
-    const h = host({ rules: TRIAGE_RULES, routes })
-    await pollRound(h.ctx)
-    h.state.set(KV.yunxiao.triage('wi-1'), { state: 'go', answer: '开工', at: '', cycle: 0 })
-    await pollRound(h.ctx)
-    expect(h.receive).toHaveBeenCalledOnce()
-    // The fix waits for verification, and then the work item is reopened: the next cycle is a new question.
-    routes['projex-search-workitems'] = search(workitem({ status: '29' }))
-    await pollRound(h.ctx)
-    routes['projex-search-workitems'] = search(workitem({ status: '30' }))
-    await pollRound(h.ctx)
-    expect(h.larkCalls).toHaveLength(2)
-    expect(h.state.get(KV.yunxiao.triage('wi-1'))).toMatchObject({ state: 'asked', cycle: 1 })
+  it('admits a triage assignment as an inferred candidate, and a direct one as the explicit request', async () => {
+    // The real gate: only a listed account's unaddressed Trigger in an observed scope becomes a candidate for the assessment.
+    const settings = SettingsSchema.parse({ policy: { sources: { yunxiao: { allowed: [{ id: AGENT }] } } }, eval: { mode: 'auto' } })
+    const triage = host({ rules: TRIAGE_RULES, routes: { 'projex-search-workitems': search(workitem()) } })
+    await pollRound(triage.ctx)
+    const candidate = triage.receive.mock.calls[0]![0]
+    // A fresh Thread: a Thread that already has tickets would make it a follow-up instead of an admission decision.
+    const fresh = { ...workitemThread('wi-1'), subscriptions: [] }
+    expect(settingsPolicy(settings, triage.sources).gate(candidate, fresh, []))
+      .toMatchObject({ admissible: true, strength: 'inferred', basis: { via: 'admission', cell: 'listedUnaddressed' } })
+    const direct = host({ routes: { 'projex-search-workitems': search(workitem()) } })
+    await pollRound(direct.ctx)
+    const request = direct.receive.mock.calls[0]![0]
+    expect(settingsPolicy(settings, direct.sources).gate(request, workitemThread('wi-1'), []))
+      .toMatchObject({ admissible: true, strength: 'explicit', basis: { via: 'addressed' } })
   })
-  it('starts a work item the approver answered after the search window had passed it', async () => {
-    const routes: Record<string, unknown> = { 'projex-search-workitems': search(workitem()),
-      'projex-get-workitem': { workitem: workitem() } }
-    const h = host({ rules: TRIAGE_RULES, routes })
+  it('keeps a direct project\'s assignment as the request itself', async () => {
+    const h = host({ routes: { 'projex-search-workitems': search(workitem()) } })
     await pollRound(h.ctx)
-    h.state.set(KV.yunxiao.triage('wi-1'), { state: 'go', answer: '开工', at: '', cycle: 0 })
-    // The work item is not modified again, so no later search returns it: the answer has to start the work on its own.
-    routes['projex-search-workitems'] = search()
-    await pollRound(h.ctx)
-    expect(h.receive).toHaveBeenCalledOnce()
-    expect(h.receive.mock.calls[0]![0].id).toBe(workitemTriggerId('wi-1', 0))
-    // The stored Trigger is the record that the work started: another round does not start it again.
-    await pollRound(h.ctx)
-    expect(h.receive).toHaveBeenCalledOnce()
-  })
-  it('spends an answer whose work item was assigned away while the question waited', async () => {
-    const routes: Record<string, unknown> = { 'projex-search-workitems': search(workitem()),
-      'projex-get-workitem': { workitem: workitem({ assignedTo: { id: 'user-2' } }) } }
-    const h = host({ rules: TRIAGE_RULES, routes })
-    await pollRound(h.ctx)
-    h.state.set(KV.yunxiao.triage('wi-1'), { state: 'go', answer: '开工', at: '', cycle: 0 })
-    await pollRound(h.ctx)
-    expect(h.receive).not.toHaveBeenCalled()
-    // The answer is spent rather than replayed on a work item that is somebody else's now.
-    expect(h.state.get(KV.yunxiao.triage('wi-1'))).toBeUndefined()
-  })
-  it('reports and drops an answer whose work item is gone', async () => {
-    const routes: Record<string, unknown> = { 'projex-search-workitems': search(workitem()),
-      'projex-get-workitem': new CliError('工作项不存在', 404) }
-    const h = host({ rules: TRIAGE_RULES, routes })
-    await pollRound(h.ctx)
-    h.state.set(KV.yunxiao.triage('wi-1'), { state: 'go', answer: '开工', at: '', cycle: 0 })
-    await pollRound(h.ctx)
-    expect(h.receive).not.toHaveBeenCalled()
-    // A work item that is gone never starts: the answer is spent, so no round asks for it again.
-    expect(h.state.get(KV.yunxiao.triage('wi-1'))).toBeUndefined()
-    expect(h.board.all.yunxiao).toMatchObject({ state: 'error', detail: expect.stringContaining('triage answer of wi-1') })
-  })
-  it('keeps the answer when the work item could not be read this round', async () => {
-    const routes: Record<string, unknown> = { 'projex-search-workitems': search(workitem()),
-      'projex-get-workitem': new Error('StatusCode: 500 Internal Server Error') }
-    const h = host({ rules: TRIAGE_RULES, routes })
-    await pollRound(h.ctx)
-    h.state.set(KV.yunxiao.triage('wi-1'), { state: 'go', answer: '开工', at: '', cycle: 0 })
-    await expect(pollRound(h.ctx)).rejects.toThrow('triage answer of wi-1')
-    // A failed read is not the same as a work item that is gone: the answer waits for the next round.
-    expect(h.state.get(KV.yunxiao.triage('wi-1'))).toMatchObject({ state: 'go' })
-    routes['projex-get-workitem'] = { workitem: workitem() }
-    await pollRound(h.ctx)
-    expect(h.receive).toHaveBeenCalledOnce()
-  })
-  it('treats a bare approval word as carrying no supplement', async () => {
-    const h = host({ rules: TRIAGE_RULES, routes: { 'projex-search-workitems': search(),
-      'projex-get-workitem': { workitem: workitem() } } })
-    // 「可以」 says only that the work may start: it is not information for the worker, so it does not travel with the Trigger.
-    h.state.set(KV.yunxiao.triage('wi-1'), { state: 'go', answer: '可以', at: '', cycle: 0 })
-    await pollRound(h.ctx)
-    expect(h.receive).toHaveBeenCalledOnce()
-    expect(h.receive.mock.calls[0]![0].text).not.toContain('补充信息')
-  })
-  it('waits for the approver before moving a reopened work item to its started status', async () => {
-    const h = host({ rules: TRIAGE_RULES, tickets: { open: [openTicket('t-1', 'wi-1')] },
-      triggers: { 'origin-wi-1': originTrigger('wi-1') },
-      routes: { 'projex-search-workitems': search(), 'projex-get-workitem': { workitem: workitem() } } })
-    // The work item is reopened into a second repair cycle while its ticket is still open, and the approver is asked again.
-    h.state.set(KV.yunxiao.workitem('wi-1'), { cycle: 1, status: '30', assignee: AGENT, commentAt: '' })
-    h.state.set(KV.yunxiao.triage('wi-1'), { state: 'asked', messageId: 'om_1', at: '', cycle: 1 })
-    await pollRound(h.ctx)
-    // Moving it to the started status now would make the answer find a work item that no longer waits for work.
-    expect(h.calls.filter(argv => argv[1] === 'projex-update-workitem')).toEqual([])
-    // Once the answer starts the cycle, the move follows.
-    h.state.set(KV.yunxiao.triage('wi-1'), { state: 'go', messageId: 'om_1', answer: '开工', at: '', cycle: 1 })
-    await pollRound(h.ctx)
-    expect(h.receive).toHaveBeenCalledOnce()
-    expect(h.calls.filter(argv => argv[1] === 'projex-update-workitem')).toHaveLength(1)
-    expect(h.state.get(KV.yunxiao.started('t-1'))).toMatchObject({ status: '100010', cycle: 1 })
+    const trigger = h.receive.mock.calls[0]![0]
+    expect(trigger).toMatchObject({ addressed: 'mention', meta: { workitemId: 'wi-1', cycle: 0 } })
+    expect(trigger.meta).not.toHaveProperty('triage')
+    // Without an approver in the rules, the ticket's messages go to the work item itself.
+    expect(trigger.channel).toMatchObject({ source: 'yunxiao', address: { workitem: 'wi-1' } })
   })
 })
 

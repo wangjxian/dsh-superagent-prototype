@@ -21,7 +21,7 @@ import type { Outbox } from './outbox.ts'
 import type { Store } from './store.ts'
 
 /** The state of one merge request's approval, as `KV.merge.mr` records it. */
-export type MergeState = 'waiting' | 'confirmed' | 'merging' | 'merged' | 'rejected' | 'retarget' | 'closed'
+export type MergeState = 'waiting' | 'confirmed' | 'merging' | 'merged' | 'rejected' | 'retarget' | 'replaced' | 'closed'
 /** One merge request a worker asks to merge, as `orchestrator_report` names it. */
 export interface MergeRequestRef { repository: string; localId: number }
 /** What a merge request's confirmation says about it, which the approver reads before answering. */
@@ -60,6 +60,7 @@ export interface MergeHost {
     readonly atomic: Store['atomic']
     readonly get: Store['get']
     readonly set: Store['set']
+    readonly delete: Store['delete']
     readonly keys: Store['keys']
   }
   readonly outbox: Pick<Outbox, 'send'>
@@ -67,6 +68,12 @@ export interface MergeHost {
   readonly note: (ticketId: string, text: string) => void
   /** The approver's Feishu open_id: from the receiving rules, or the last direct message the approver sent. */
   readonly approver: () => string
+  /**
+   * The approver's answers to a triage question: `approved` re-delivers the request as the explicit one it now is, and
+   * `declined` records that the work waits. Absent, the question stays open rather than deciding into nothing.
+   */
+  readonly approved?: (triggerId: string, answer: string) => void | string | Promise<void | string>
+  readonly declined?: (triggerId: string, answer: string) => void
   /** The merge type the receiving rules name (`release.mergeType`); empty or absent merges with `DEFAULT_MERGE_TYPE`. */
   readonly mergeType?: () => string
   /**
@@ -85,8 +92,9 @@ interface ConfirmationRecord {
   /** The kinds this module answers; a `ticket` record is the host's own, and one of another kind is left alone. */
   kind?: 'merge' | 'pipeline' | 'sql' | 'triage'
   pipeline?: { id: string; name: string }
-  /** A triage question names the work item it asks about; a ticket's own message names the ticket an answer belongs to. */
+  /** A triage question names the work item and the request it asks about; a ticket's own message names the ticket it is for. */
   workitemId?: string
+  triggerId?: string
   sql?: readonly SqlStatement[]
 }
 /** A pipeline a worker asks the host to start, as the CLI reports it. */
@@ -160,6 +168,15 @@ export function sqlConfirmationText(input: { serial?: string; title: string; act
     '检查语句（返回 1/0）：', action.check.trim(),
   ].join('\n'))
   return [head, ...blocks, '请直接回复本条消息：同意 / 写原因驳回（SQL 没有可改的目标 release）。'].join('\n\n')
+}
+/**
+ * The question the approver answers before an assessment's finding becomes work: which work item, why it needs a person, and
+ * how to reply. Like the other confirmations, it is user-facing copy in the team's language.
+ */
+export function triageQuestionText(input: { title: string; url?: string; reason: string }): string {
+  const head = ['【需要你确认】', input.title].filter(Boolean).join(' ')
+  return [head, ...input.url ? [input.url] : [], '', `评估认为这件事需要你决定：${input.reason}`, '',
+    '回复「开工」开始处理；回复「不做」跳过；其他文字视为补充信息并开工。'].join('\n')
 }
 /** How the target-release rule reached its answer, in the approver's language. */
 const BASIS: Record<TargetRelease['basis'], string> = {
@@ -296,6 +313,7 @@ interface Waiting { thread: string; commit: string; target: string }
  * confirmation message, which is how a reply finds the merge requests it is about.
  */
 export class Merges {
+  private readonly triageAnswers = new Set<string>()
   constructor(private readonly host: MergeHost) {}
 
   /** The Codeup account the host acts as; merging is a Codeup operation, so another platform has none. */
@@ -422,6 +440,29 @@ export class Merges {
   }
 
   /**
+   * Asks the approver whether a request an assessment could not settle should become work: one Feishu direct message naming
+   * the work item and the reason, and one record that the reply is matched by.
+   * @returns a status the host can act on; a thrown error means nothing was sent or recorded.
+   */
+  async askTriage(trigger: Trigger, reason: string): Promise<MergeRequestResult> {
+    const { store, commands } = this.host
+    const approver = this.host.approver()
+    if (!approver) return { status: 'unconfigured', message: 'No approver is configured: set approver.feishuOpenId in the receiving rules' }
+    // One question per request: asking again while it waits would send the approver a second message.
+    if (this.pendingTriage(trigger.id)) return { status: 'already', message: 'The approver already has a question about this request' }
+    const workitemId = typeof trigger.meta.workitemId === 'string' ? trigger.meta.workitemId : ''
+    // The Trigger's own text opens with the work item's number and title, which is what the approver recognizes it by.
+    const title = trigger.text.split('\n')[0]?.trim() ?? ''
+    const text = triageQuestionText({ title: title || workitemId, ...trigger.url ? { url: trigger.url } : {}, reason })
+    const messageId = await createFeishuDirect(commands, { openId: approver, text, idempotencyKey: key('triage-question', trigger.id) })
+    // The message id is what a reply names: without it the question could never be answered (see feishu-channel.ts).
+    if (!messageId) throw new Error('Feishu did not report the question message id, so its reply could not be matched')
+    store.set(KV.merge.message(messageId), { thread: '', ticketId: '', at: new Date().toISOString(), kind: 'triage', workitemId,
+      triggerId: trigger.id })
+    return { status: 'requested', message: `Asked the approver about ${title || workitemId || trigger.id} in Feishu` }
+  }
+
+  /**
    * A Trigger the Feishu Source marked as an answer to a confirmation: the approver's answer, acted on here. Merge
    * confirmations merge the confirmed commit; pipeline confirmations start the pipeline the host may not start alone.
    * @returns whether this module handled the Trigger; a trigger that is no approval reply is left to the host's other parts.
@@ -437,7 +478,7 @@ export class Merges {
       this.reply(trigger, '只有配置的审批人可以确认这条请求。'); return true
     }
     // A triage question is about a work item no ticket exists for yet, so it is answered before any ticket is looked up.
-    if (record.kind === 'triage') { this.answerTriage(trigger, messageId, record); return true }
+    if (record.kind === 'triage') { await this.answerTriage(trigger, messageId, record); return true }
     const ticket = store.tickets.get(record.ticketId)
     if (!ticket || !liveTicket(ticket)) { this.reply(trigger, '这条确认对应的工单已结束，不再处理。'); return true }
     const reply = parseReply(trigger.text)
@@ -489,7 +530,7 @@ export class Merges {
     if (ci === 'pending') return { problem: `${label} has a CI check that has not finished` }
     const unresolved = await this.unresolvedComments(account, repository.id, change.localId)
     if (unresolved) return { problem: `${label} has ${unresolved} unresolved review comment(s)` }
-    const requested = this.requestedRelease(ticket, repository.id)
+    const requested = await this.requestedRelease(ticket, repository.id)
     const target = await targetRelease({ organization: account.organization, repository, caller: commands, ...requested ? { requested } : {} })
     if (request.target !== target.target) {
       return { problem: `${label} targets ${request.target || 'no branch'}, but it must target ${target.target}; move it there before asking to merge` }
@@ -498,11 +539,22 @@ export class Merges {
       basis: target.basis, ci, commit: request.head }
   }
 
-  /** The release the approver moved this ticket's delivery to in `repositoryId`, which wins over the computed one. */
-  private requestedRelease(ticket: Ticket, repositoryId: string): string | undefined {
+  /**
+   * The release the approver moved this ticket's delivery to in `repositoryId`, which wins over the computed one. A release
+   * that has merged back meanwhile is published, so its override expires and the rule decides afresh. The old merge request
+   * stays recorded until its replacement merges, which is when the host closes it.
+   */
+  private async requestedRelease(ticket: Ticket, repositoryId: string): Promise<string | undefined> {
+    const account = this.account()
+    if (!account) return undefined
     for (const follow of ticket.follows ?? []) {
       const record = this.host.store.get(KV.merge.mr(follow.thread))
-      if (record?.state === 'retarget' && mergeTargetOf(follow.thread)?.repository === repositoryId) return record.target
+      if (record?.state !== 'retarget' || mergeTargetOf(follow.thread)?.repository !== repositoryId) continue
+      // `mergedBack` asks whether this very release has published, which is not the same as the rule naming another one: an
+      // approver may deliberately choose a release the rule would not, and that choice stands until it is published.
+      const published = await this.mergedBack(account, repositoryId, record.target)
+      if (!published) return record.target
+      this.host.store.set(KV.merge.mr(follow.thread), { ...record, state: 'replaced' })
     }
     return undefined
   }
@@ -613,7 +665,8 @@ export class Merges {
     for (const follow of ticket.follows ?? []) {
       const old = mergeTargetOf(follow.thread)
       const record = this.host.store.get(KV.merge.mr(follow.thread))
-      if (!old || follow.thread === merged || old.repository !== repository || record?.state !== 'retarget') continue
+      if (!old || follow.thread === merged || old.repository !== repository
+        || (record?.state !== 'retarget' && record?.state !== 'replaced')) continue
       try { await this.host.commands.aliyun(YUNXIAO.closeChangeRequest(account.organization, old.repository, old.localId)) }
       catch { continue }
       this.host.store.set(KV.merge.mr(follow.thread), { ...record, state: 'closed' })
@@ -657,27 +710,37 @@ export class Merges {
    * Source reads it, keeping the repair cycle the question was asked for. Words beyond a bare approval travel with it as the
    * supplement the Source folds into the work item's trigger.
    */
-  private answerTriage(trigger: Trigger, messageId: string, record: ConfirmationRecord): void {
-    const { store } = this.host
-    const workitemId = record.workitemId ?? ''
-    const asked = workitemId ? store.get(KV.yunxiao.triage(workitemId)) : undefined
-    // The question was answered already, or the work item moved on to another cycle: this reply decides nothing.
-    if (!asked || asked.state !== 'asked') { this.reply(trigger, '这条确认已经处理过了。'); return }
+  private async answerTriage(trigger: Trigger, messageId: string, record: ConfirmationRecord): Promise<void> {
+    const triggerId = record.triggerId ?? ''
+    // Answered already, or a question recorded before it named its request: this reply decides nothing.
+    if (!triggerId) { this.reply(trigger, '这条确认已经处理过了。'); return }
     const answer = triageAnswer(trigger.text)
     // A reply that names no decision — a question, an image, a word we cannot read — decides nothing: the question stays
     // open, so the person can answer again, rather than starting work on a guess.
     if (!answer) {
       this.reply(trigger, '没看懂这条回复，先没开工；回复「开工」开始，或直接说要补充的信息。'); return
     }
-    // The cycle the question was asked for stays as it was: the Source uses it to know whether this cycle asked already.
-    store.set(KV.yunxiao.triage(workitemId), { ...asked, state: answer.state, at: new Date().toISOString(), answer: answer.answer })
-    // Answered: the record still maps the message, but no longer names the work item it asked about.
-    store.set(KV.merge.message(messageId), { thread: record.thread, ticketId: record.ticketId, at: record.at, kind: 'triage' })
-    // A reply that is nothing but the opening words carries no supplement, whatever particle ends it.
-    const opening = TRIAGE_GO.exec(answer.answer)?.[0] ?? ''
-    const bare = TRIAGE_BARE.test(answer.answer) || answer.answer.slice(opening.length).trim() === ''
-    this.reply(trigger, answer.state === 'declined' ? '已跳过这条工作项。'
-      : bare ? '已开始处理这条工作项。' : '已把补充信息转给工作项，开始处理。')
+    // The decision goes back to the request it was asked about; a host that cannot take it leaves the question open.
+    const decide = answer.state === 'declined' ? this.host.declined : this.host.approved
+    if (!decide) { this.reply(trigger, '暂时无法处理这条回复，请稍后再试。'); return }
+    if (this.triageAnswers.has(messageId)) { this.reply(trigger, '这条确认正在处理，请稍候。'); return }
+    this.triageAnswers.add(messageId)
+    try {
+      let refused: void | string
+      try { refused = await decide(triggerId, answer.answer) }
+      catch (error) {
+        this.reply(trigger, `暂时无法确认工作项当前状态，未开工：${errorText(error)}。请稍后回复「开工」重试。`)
+        return
+      }
+      // Answered: the record still maps the message, but no longer names the request it asked about.
+      this.host.store.set(KV.merge.message(messageId), { thread: record.thread, ticketId: record.ticketId, at: record.at, kind: 'triage' })
+      if (refused) { this.reply(trigger, refused); return }
+      // A reply that is nothing but the opening words carries no supplement, whatever particle ends it.
+      const opening = TRIAGE_GO.exec(answer.answer)?.[0] ?? ''
+      const bare = TRIAGE_BARE.test(answer.answer) || answer.answer.slice(opening.length).trim() === ''
+      this.reply(trigger, answer.state === 'declined' ? '已跳过这条工作项。'
+        : bare ? '已开始处理这条工作项。' : '已把补充信息转给工作项，开始处理。')
+    } finally { this.triageAnswers.delete(messageId) }
   }
 
   /** Marks a pipeline confirmation answered: its record still maps the message to its ticket, but names no pipeline. */
@@ -734,6 +797,15 @@ export class Merges {
     return store.keys(KV.merge.message).some(name => {
       const record = store.get(name)
       return record?.kind === 'sql' && this.open(record) && (record.sql ?? []).some(statement => fingerprints.includes(statement.fingerprint))
+    })
+  }
+
+  /** Whether a question about one request already waits for the approver. */
+  private pendingTriage(triggerId: string): boolean {
+    const { store } = this.host
+    return store.keys(KV.merge.message).some(name => {
+      const record = store.get(name)
+      return record?.kind === 'triage' && record.triggerId === triggerId
     })
   }
 

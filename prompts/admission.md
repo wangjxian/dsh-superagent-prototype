@@ -33,6 +33,7 @@ One source message produces at most one ticket.
 If matching rules conflict or the scope is ambiguous, ignore quietly.
 Rule order has no priority.
 
+A work item that arrived as an observation rather than a request is judged the same way: accept it when a rule matches and the direction is settled. When the only thing unsettled is a product or design decision, say so with requires_design_decision and evidence naming what is open; the host then asks the approver, and their answer comes back as an explicit request whose text begins with 【审批人已确认开工】, which settles the direction you flagged.
 Every decision, including ignore and unavailable, must provide direction: implementation_requested, target_basis, requires_design_decision and evidence.
 Evidence must identify the source statements and any established target/reference; do not invent evidence to make the booleans pass.
 Accept only when implementation was requested, target_basis is specified or existing-standard, and no product/design decision remains.

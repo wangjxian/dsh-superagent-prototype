@@ -75,7 +75,22 @@ export const KV = {
      * The status a Ticket's work item was moved to when its work started, with the repair cycle it was moved for: the move
      * happens once per cycle, so a work item reopened into a new cycle is moved again.
      */
-    started: family<{ at: string; status: string; cycle?: number }, [ticketId: string]>('yunxiao-started:') },
+    started: family<{ at: string; status: string; cycle?: number }, [ticketId: string]>('yunxiao-started:'),
+    qa: family<{ pipelineId: string; runId: string; repository: string; branch: string; commit: string;
+      qaBranch?: string; qaCommit?: string; mergeRequest?: number; integrationBranch?: string; integrationCommit?: string },
+      [ticketId: string, repository: string]>('yunxiao-qa:'),
+    qaDelivery: family<{ branch: string; commit: string; sourceBranch: string; sourceCommit: string; qaBranch: string;
+      beforeRunId: string; qaCommit?: string; mergeRequest?: number; createAttempted?: true; createdRunId?: string }, [ticketId: string, repository: string]>('yunxiao-qa-delivery:'),
+    qaMr: family<{ ticketId: string; repository: string; mergeRequest: number; sourceBranch: string; qaBranch: string; commit: string; superseded?: true },
+      [organization: string, repository: string, localId: number]>('yunxiao-qa-mr:'),
+    qaScope: family<{ branch: string; repositories: string[] }, [ticketId: string]>('yunxiao-qa-scope:'),
+    qaPlan: family<{ environment: string; projects: { repository: string; pipelineId: string; command: string; directory: string;
+      qaBranch?: string; mergeMode?: 'direct' | 'merge-request'; integrationBranch?: string; integrationDirectory?: string;
+      integrationCommit?: string; integrationOutput?: string;
+      commit?: string; output?: string }[]; tested?: boolean }, [ticketId: string]>('yunxiao-qa-plan:'),
+    qaTest: family<{ environment: string; command: string; output: string; at: string;
+      projects: { repository: string; pipelineId: string; runId: string; commit: string; qaBranch?: string; qaCommit?: string }[] }, [ticketId: string]>('yunxiao-qa-test:'),
+    qaLatest: family<{ runId: string }, [organization: string, pipelineId: string]>('yunxiao-qa-latest:') },
   /**
    * Merge approvals: the state of each change request a ticket asked to merge, the confirmation message it waits on, and the
    * message ids a person's reply may answer.
@@ -88,7 +103,9 @@ export const KV = {
       pipeline?: { id: string; name: string }
       sql?: readonly { title: string; file: string; database: string; phase: 'before' | 'after'; fingerprint: string }[]
       /** A triage question names the work item it asks about; a ticket's own message names the ticket an answer belongs to. */
-      workitemId?: string },
+      workitemId?: string
+      /** A triage question names the trigger whose assessment left the decision to a person. */
+      triggerId?: string },
       [messageId: string]>('merge-message:'),
     /** The approver bound by their first direct message to the bot, when the receiving rules name none. */
     approver: record<{ openId: string; chatId: string; at: string }>('merge-approver') },

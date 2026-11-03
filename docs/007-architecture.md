@@ -379,6 +379,7 @@ Some generic modules still refer directly to a platform:
 | `src/sources/yunxiao-channel.ts` | The yunxiao Channel: comments on a work item, marked as an agent's, `sent` or `gone`, and the work item's page link |
 | `src/sources/yunxiao-write.ts` | Write-back of a finished Ticket: the result comment in the team's five states, the status a verified fix moves to, and the refusal of a workflow that does not allow it |
 | `src/sources/yunxiao-mr.ts` | The merge requests a Ticket follows: a poll round of each one's state, conflict and head, its comments and its CI, the Triggers those changes become, and the `yunxiao:mr:<repository id>:<n>` Threads they belong to |
+| `src/app/qa.ts` | Local unit tests, project QA publication and deployed integration verification: preserve the existing branch-manager inputs, serialize starts, retain the actual run and commit, and verify successful QA evidence before completing a Yunxiao work item |
 | `src/app/merge.ts` | The host's merge approvals: the conditions a merge request must meet, the Feishu confirmation message with the target release it suggests, the reply parsed by code (`同意`, `改 <release>`, or a reason that rejects), the checks before merging, and the merge itself, which only the host runs |
 | `src/sources/feishu.ts` | The Feishu kind and plugin entry, exported as `./feishu-watch` |
 | `src/sources/feishu-trigger.ts` | Feishu messages as Triggers, by one rule for live events, history pages and topic pages |
@@ -431,6 +432,8 @@ Some generic modules still refer directly to a platform:
 | `tests/yunxiao-channel.spec.ts` | The yunxiao Channel: the comment it writes with the agent's marker, a work item that is gone, and the page link |
 | `tests/yunxiao-write.spec.ts` | Write-back: the result comment in each state, the status a verified fix moves to, and a workflow that refuses the move |
 | `tests/yunxiao-mr.spec.ts` | Merge-request polling: the state, comment and CI Triggers, a close reported to the Engine, the agent's own comments skipped, the CI baseline, and one merge request's failure staying its own |
+| `tests/qa.spec.ts` | Fixed-QA integration: pure development and QA-only conflict branches, shared-QA ancestry, complete project scope, native MR/run reconciliation, trigger rejection and actual deployment testing |
+| `tests/reopen-worktree.spec.ts` | Real Git worktree reuse after completion and reopen: same occupied serial branch, execution directory, HEAD and unfinished edits; no repeated prepare |
 | `tests/merge.spec.ts` | Merge approvals: the confirmation message, the three kinds of reply, a check that fails so nothing merges, a merge that runs the host's command, the notes a rejection and a move to another release leave, and a request repeated |
 | `tests/feishu-dm.spec.ts` | Direct messages from the bot: the message it creates in a person's chat, its idempotency key, the approval marker a reply carries, and the link of a direct conversation |
 | `tests/commands.spec.ts` | CLI calls as the deployment's accounts, the Channels' answers, repository-scoped GitHub calls, and the yunxiao calls that read the keychain token for one process, retry only reads and report the CLI's own `StatusCode` |

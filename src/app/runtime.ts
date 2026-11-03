@@ -14,7 +14,7 @@ import { mkdirSync } from 'node:fs'
 import { join } from 'node:path'
 import { lockSync } from 'proper-lockfile'
 import { Engine, key, reasonText, type EngineForSettings, type ReceiveResult, type Ticket, type Trigger } from '../core/index.ts'
-import { allowedSender, settingsPolicy } from '../policy.ts'
+import { AdmissionDirectionSchema, allowedSender, settingsPolicy } from '../policy.ts'
 import { SourceRegistry } from '../sources/registry.ts'
 import { Commands } from '../infra/commands.ts'
 import type { Deployment, Machine } from '../deployment.ts'
@@ -27,7 +27,7 @@ import { KV } from '../kv.ts'
 import { Store } from './store.ts'
 import { evalsHealth } from './views/overview.ts'
 import { TextCache } from './cache.ts'
-import { Effects } from './effects.ts'
+import { Effects, Later } from './effects.ts'
 import { Prompts } from './prompts.ts'
 import { registerHttp, type HttpHost } from './http.ts'
 import type { LinkTarget } from './views/records.ts'
@@ -46,7 +46,12 @@ import type { ResourceHost } from './resources.ts'
 import { mainTools, type MainToolsHost } from './tools/main.ts'
 import { Merges } from './merge.ts'
 import { currentRules } from '../sources/yunxiao.ts'
-import { workerPipelinePrefixes } from '../infra/environment.ts'
+import { TRIAGE_BARE, workitemOf, workitemTrigger, yunxiaoRef } from '../sources/yunxiao-trigger.ts'
+import { projectOf, typeOf } from '../sources/yunxiao-config.ts'
+import { YUNXIAO } from '../infra/yunxiao.ts'
+import { sameName } from '../infra/text.ts'
+import { z } from 'zod'
+import { runAsWorker, workerPipelinePrefixes } from '../infra/environment.ts'
 import { executorTools, type ExecutorToolsHost } from './tools/executor.ts'
 
 // Source plugins interact with dsh-superagent exclusively through the `SourceHost` service interface.
@@ -149,8 +154,47 @@ export class Runtime extends Service implements SourceHost {
         const written = workerPipelinePrefixes(machine.stateDir)
         return written.length ? written : currentRules()?.file.pipelines.allowPrefixes ?? []
       }
+      /**
+       * A triage trigger the assessment could not settle is a question for the approver: their answer is the explicit request
+       * that starts the work, so it comes back as a new Trigger rather than as an Eval of the old one.
+       */
+      const askApprover = (decisionId: string): void => {
+        const decision = store.decisions.get(decisionId)
+        if (!decision || decision.kind !== 'ignore' || !merges?.askTriage) return
+        const direction = AdmissionDirectionSchema.safeParse(decision.audit?.direction)
+        if (!direction.success || !direction.data.implementation_requested
+          || (!direction.data.requires_design_decision && direction.data.target_basis !== 'undetermined')) return
+        for (const triggerId of decision.triggerIds) {
+          const trigger = store.triggers.get(triggerId)
+          if (trigger?.meta.triage !== true) continue
+          // A no the approver already gave this cycle is not asked about again.
+          const asked = store.get(KV.yunxiao.triage(String(trigger.meta.workitemId)))
+          if (asked?.state === 'declined' && asked.cycle === Number(trigger.meta.cycle)) continue
+          const reason = reasonText(decision.reason.find(item => item.triggerId === triggerId) ?? decision.reason)
+          this.effects.enqueue('triage', trigger.id, { triggerId: trigger.id, reason })
+        }
+      }
       // The approver is the person the receiving rules name, or the one whose first direct message bound them.
       const approver = () => currentRules()?.file.approver.feishuOpenId || store.get(KV.merge.approver)?.openId || ''
+      const currentTriage = async (trigger: Trigger): Promise<Trigger | string> => {
+        if (trigger.source !== 'yunxiao') return trigger
+        const stale = '工作项指派、状态、项目、类别或修复周期已变化，本次确认已过期，未开工。请按当前工作项重新分诊。'
+        if (store.settings().sources.yunxiao?.enabled !== true) return stale
+        if (!setup.configured()) throw new Later('Waiting for deployment setup before Yunxiao triage')
+        const ref = yunxiaoRef(trigger), account = setup.deployment.codeup, file = currentRules()?.file
+        if (!file) throw new Later('Waiting for Yunxiao receiving rules to load')
+        if (!account || file.organization !== account.organization || !ref.workitemId) return stale
+        const item = workitemOf(await commands.aliyun(z.unknown(), YUNXIAO.workitem(file.organization, ref.workitemId)))
+        const current = currentRules()?.file, project = current && projectOf(current, item.projectId)
+        if (!current && store.settings().sources.yunxiao?.enabled === true) throw new Later('Waiting for Yunxiao receiving rules to load')
+        const type = project && typeOf(project, item.category), cycle = Number(trigger.meta.cycle)
+        if (current?.organization !== file.organization || store.settings().sources.yunxiao?.enabled !== true || !project || project.intake !== 'triage' || !type
+          || item.id !== ref.workitemId || item.projectId !== ref.projectId || item.category !== ref.category
+          || !sameName(item.assignee, account.account.id) || !sameName(trigger.actor.id, account.account.id)
+          || !type.receive.includes(item.status) || !Number.isInteger(cycle) || cycle < 0
+          || store.get(KV.yunxiao.workitem(item.id))?.cycle !== cycle) return stale
+        return { ...workitemTrigger(item, account.account.id, cycle, account.account.id, { channel: trigger.channel, triage: true }), id: trigger.id }
+      }
       let merges: Merges | undefined
       /**
        * A message the host answers itself (a merge confirmation) is no work, and the approver's first direct message binds
@@ -163,6 +207,12 @@ export class Runtime extends Service implements SourceHost {
           // An answer to a message the host started in a ticket's own conversation is that ticket's: it becomes a note.
           const repliedTo = [trigger.meta.parentId, trigger.meta.rootId].find(id => typeof id === 'string' && store.get(KV.merge.message(id)))
           const record = typeof repliedTo === 'string' ? store.get(KV.merge.message(repliedTo)) : undefined
+          const origin = record?.ticketId ? store.triggers.get(store.tickets.get(record.ticketId)?.origin.triggerId ?? '') : undefined
+          if (record?.kind === 'merge' && origin && yunxiaoRef(origin).workitemId) {
+            if (trigger.channel) outbox.send({ id: key('qa-obsolete-merge', trigger.id), channel: trigger.channel,
+              text: '该工作项已切换到 QA 流水线集成；旧合并确认不再生效，不会合并 MR。', kind: 'reply' })
+            return
+          }
           if (record?.kind === 'ticket' && record.ticketId) {
             try { engine.note(record.ticketId, `【审批人】${trigger.text}`) } catch { /* the ticket ended meanwhile */ }
             return
@@ -193,10 +243,44 @@ export class Runtime extends Service implements SourceHost {
           }
           // Approval replies and the approver's first direct message are the host's, handled once this transaction commits.
           if (event.type === 'trigger.received') queueMicrotask(() => handleReceived(event.data.triggerId))
+          // Queue the question in the decision transaction; the durable effect sends it after commit.
+          if (event.type === 'decision.recorded') askApprover(event.data.decisionId)
         } })
       this.merges = merges = new Merges({ commands, store, outbox, approver, pipelines: pipelinePrefixes,
         mergeType: () => currentRules()?.file.release.mergeType ?? '',
-        note: (ticketId, text) => { try { engine.note(ticketId, text) } catch { /* the ticket ended meanwhile */ } } })
+        note: (ticketId, text) => { try { engine.note(ticketId, text) } catch { /* the ticket ended meanwhile */ } },
+        // The approver's yes is a person's explicit instruction, so it arrives as a new Trigger on the work item's thread; the
+        // original stays the observation it was, and the assessment sees a request it can settle.
+        approved: async (triggerId, answer) => {
+          const trigger = store.triggers.get(triggerId)
+          if (!trigger) return '这条分诊请求已失效，未开工。'
+          const fresh = await currentTriage(trigger)
+          if (typeof fresh === 'string') return fresh
+          const supplement = answer && !TRIAGE_BARE.test(answer) ? `\n\n补充信息（审批人）：${answer}` : ''
+          // The assessment has to know a person settled the direction, or it would leave the same question open again.
+          const text = `【审批人已确认开工】\n\n${fresh.text}${supplement}`
+          const received = engine.receive({ ...fresh, id: `${trigger.id}:approved`, addressed: 'direct', text,
+            meta: { ...fresh.meta, triage: false, approved: true, approvedBy: approver() } })
+          if (received === 'filtered') return '当前接单规则不允许这条工作项，未开工。请重新检查分诊与接单配置。'
+        },
+        // A no is remembered for the repair cycle, so the same work item is not put to the approver twice.
+        declined: triggerId => {
+          const trigger = store.triggers.get(triggerId)
+          if (!trigger) return
+          store.set(KV.yunxiao.triage(String(trigger.meta.workitemId)),
+            { state: 'declined', at: new Date().toISOString(), cycle: Number(trigger.meta.cycle) })
+        } })
+      effects.handle('triage', async ({ triggerId, reason }) => {
+        const trigger = store.triggers.get(triggerId)
+        if (!trigger || trigger.meta.triage !== true) return
+        const declined = store.get(KV.yunxiao.triage(String(trigger.meta.workitemId)))
+        if (declined?.state === 'declined' && declined.cycle === Number(trigger.meta.cycle)) return
+        const fresh = await currentTriage(trigger)
+        if (typeof fresh !== 'string') {
+          const result = await merges!.askTriage(fresh, reason)
+          if (result.status === 'unconfigured') throw new Later(result.message)
+        }
+      }, { limit: () => this.paused() ? 0 : 1 })
       // Update the `evals` health entry on every pass if an evaluation failed as unavailable within the last hour.
       const evals = board.claim('evals', { state: 'ready', detail: 'No unavailable Eval in the last hour' })
       const evaluateDue = () => { engine.evaluateDue(); evals.set(evalsHealth(store)) }
@@ -206,6 +290,10 @@ export class Runtime extends Service implements SourceHost {
         get deployment() { return setup.deployment }, configured: () => setup.configured(),
         get setupProblem() { return setup.problem }, get feishuProblem() { return setup.feishuProblem }, receive: trigger => passes.receive(trigger) }
       this.toolHost = { context: ctx, engine, store, prompts, sessions, settings: this.settings, assessor, resources, merges,
+        runQaCommand: (ticket, command, directory, signal, variables, timeoutMs = 600_000) => runAsWorker(ctx.subprocess,
+          ['sh', '-c', 'if qa_output=$(sh -c "$1" 2>&1); then printf "%s\\n" "$qa_output"; else printf "%s\\n" "$qa_output" >&2; exit 1; fi', 'qa-test', command],
+          directory, AbortSignal.any([this.lifetime, signal, AbortSignal.timeout(timeoutMs)]),
+          { ...Object.fromEntries(environment(ticket).map(item => [item.key, item.value])), ...variables }),
         get source() { return runtime.context({ kind: 'github', health: ['github'] }) },
         requestPass: () => { passes.request() }, sendReplies: () => outbox.sent(),
         quietly: run => { this.quiet++; try { return run() } finally { this.quiet-- } } }

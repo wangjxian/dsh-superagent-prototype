@@ -7,7 +7,7 @@ import { afterEach, beforeEach, describe, expect, it, vi } from 'vitest'
 import { SENSITIVE_ENV_PATTERN, type SubprocessRuntime } from '@deepseek-ai/dsh-subprocess'
 import { CODEUP_URL, GIT_LOCATION, agentVariables, credentialHelper, runAsWorker, verifyDirectory, verifyEnvironment, withoutDirectory, workerBin,
   workerGitConfig, workerHooks, workerPipelines, writeEnvironment, writeWorkerPipelines } from '../src/infra/environment.ts'
-import { CliError } from '../src/infra/commands.ts'
+import { CliError, Commands } from '../src/infra/commands.ts'
 import { TOKEN_MISSING, TOKEN_MISSING_STATUS, YUNXIAO } from '../src/infra/yunxiao.ts'
 import { testCodeup, testDeployment } from './fixtures/deployment.ts'
 import { gitEnv } from './fixtures/git.ts'
@@ -121,7 +121,8 @@ describe('aliyun forwarding script', () => {
     await writeEnvironment(deployment, [], keychain ?? keychainProgram(join(dir, 'real', 'security')))
   }
   // The PATH a worker has: the stand-ins first, then the system's tools, which the script uses to read the CLI's JSON.
-  const aliyun = (args: string[]) => exec(join(workerBin(dir), 'aliyun'), args, { env: { PATH: [join(dir, 'real'), '/usr/bin', '/bin'].join(':') }, timeout: 10_000 })
+  const aliyun = (args: string[], env: Record<string, string> = {}) => exec(join(workerBin(dir), 'aliyun'), args,
+    { env: { PATH: [join(dir, 'real'), '/usr/bin', '/bin'].join(':'), ...env }, timeout: 10_000 })
   it('runs a read-only call as the agent with the keychain token in its environment only', async () => {
     await setup()
     const { stdout } = await aliyun(['devops', 'codeup-get-change-request', '--organization-id', 'org-1', '--repository-id', 'repo-1', '--local-id', '3'])
@@ -130,8 +131,7 @@ describe('aliyun forwarding script', () => {
       '--repository-id', 'repo-1', '--local-id', '3'])
   })
   it('names the missing keychain entry instead of running the CLI when no token can be read', async () => {
-    // The operator's keychain has no dsh-superagent entry in a test: the shim must say so rather than run signed out.
-    await writeEnvironment(testDeployment({ stateDir: dir, github: undefined, codeup: testCodeup({ cli: aliyunProgram(join(dir, 'real', 'aliyun')) }), feishu: undefined }), [])
+    await setup(program(join(dir, 'real', 'security'), 'exit 44'))
     await expect(aliyun(['devops', 'base-get-user-by-token'])).rejects.toMatchObject({ code: TOKEN_MISSING_STATUS, stderr: expect.stringContaining(TOKEN_MISSING) })
   })
   it('opens a merge request only from a bugfix/ or feat/ branch', async () => {
@@ -143,6 +143,16 @@ describe('aliyun forwarding script', () => {
     await expect(aliyun(['devops', 'codeup-update-change-request', '--source-branch=feat/261102-add-12'])).resolves.toBeTruthy()
     for (const branch of ['release/20261031', 'master']) {
       await expect(create(branch)).rejects.toMatchObject({ code: 1, stderr: expect.stringContaining(`a worker may only open a merge request from a bugfix/ or feat/ branch, not '${branch}'`) })
+    }
+  })
+  it.each(['Bug', 'Task'])('refuses merge requests and direct pipeline starts for %s QA work items', async category => {
+    await setup()
+    const env = { DSH_SUPERAGENT_YUNXIAO_WORKITEM: 'wi-1', DSH_SUPERAGENT_YUNXIAO_SERIAL: 'SIQB-1', DSH_SUPERAGENT_YUNXIAO_CATEGORY: category }
+    await expect(aliyun(['devops', 'codeup-create-change-request', '--source-branch=SIQB-1'], env))
+      .rejects.toMatchObject({ code: 1, stderr: expect.stringContaining('Use orchestrator_qa_integrate') })
+    for (const command of ['flow-create-pipeline-run', 'flow-retry-pipeline-job-run', 'flow-rerun-pipeline-job-run']) {
+      await expect(aliyun(['devops', command, '--pipeline-id', '11'], env))
+        .rejects.toMatchObject({ code: 1, stderr: expect.stringContaining('orchestrator_qa_integrate') })
     }
   })
   it('appends the agent marker to a merge request comment a worker writes', async () => {
@@ -301,6 +311,38 @@ describe('agent git configuration', () => {
     await expect(git('-C', 'repo', 'push', 'target', 'bugfix/261102-fix-12')).resolves.toBeTruthy()
     await expect(git('-C', 'repo', 'push', 'target', '--delete', 'bugfix/261102-fix-12'))
       .rejects.toMatchObject({ stderr: expect.stringContaining('a worker may not delete refs/heads/bugfix/261102-fix-12') })
+    const sha = (await git('-C', 'repo', 'rev-parse', 'HEAD')).stdout.trim()
+    const forgedHost = { ...env, DSH_SUPERAGENT_HOST_QA_BRANCH: 'master', DSH_SUPERAGENT_HOST_QA_COMMIT: sha }
+    await expect(exec('git', ['-C', 'repo', 'push', 'target', `${sha}:refs/heads/master`], { cwd: dir, env: forgedHost }))
+      .rejects.toMatchObject({ stderr: expect.stringContaining('a worker may only push bugfix/ and feat/ branches') })
+    env.DSH_SUPERAGENT_YUNXIAO_SERIAL = 'SIQB-1'
+    env.DSH_SUPERAGENT_YUNXIAO_CATEGORY = 'Bug'
+    for (const ref of ['feat/SIQB-1', 'bugfix/SIQB-1', 'SIQB-2', '261102-fix-SIQB-1', 'SIQB-1-to-release-20261103', 'SIQB-2-qa']) {
+      await expect(git('-C', 'repo', 'push', 'target', `HEAD:refs/heads/${ref}`))
+        .rejects.toMatchObject({ stderr: expect.stringContaining('must use SIQB-1') })
+    }
+    await expect(git('-C', 'repo', 'push', 'target', 'HEAD:refs/heads/SIQB-1')).resolves.toBeTruthy()
+    await expect(git('-C', 'repo', 'push', 'target', 'HEAD:refs/heads/SIQB-1-qa')).resolves.toBeTruthy()
+    env.DSH_SUPERAGENT_YUNXIAO_CATEGORY = 'Task'
+    await git('-C', 'repo', '-c', 'user.name=Alice', '-c', 'user.email=alice@example.com', 'commit', '--allow-empty', '-q', '-m', 'second')
+    const second = (await git('-C', 'repo', 'rev-parse', 'HEAD')).stdout.trim()
+    await expect(git('-C', 'repo', 'push', 'target', 'HEAD:refs/heads/SIQB-1')).resolves.toBeTruthy()
+    await expect(git('-C', 'repo', 'push', '--force', 'target', `${sha}:refs/heads/SIQB-1`))
+      .rejects.toMatchObject({ stderr: expect.stringContaining('non-fast-forward push refused') })
+    await git('-C', 'repo', 'checkout', '--detach', sha)
+    await git('-C', 'repo', '-c', 'user.name=Alice', '-c', 'user.email=alice@example.com', 'commit', '--allow-empty', '-q', '-m', 'divergent')
+    await expect(git('-C', 'repo', 'push', '--force-with-lease', 'target', 'HEAD:refs/heads/SIQB-1'))
+      .rejects.toMatchObject({ stderr: expect.stringContaining('non-fast-forward push refused') })
+    expect((await git('--git-dir', join(dir, 'remote.git'), 'rev-parse', 'refs/heads/SIQB-1')).stdout.trim()).toBe(second)
+    // The host bypasses worker hooks on this one normal push; Git still refuses rewinding QA.
+    await git('-C', 'repo', 'remote', 'set-url', 'origin', join(dir, 'remote.git'))
+    const deployment = testDeployment({ github: undefined, codeup: testCodeup({ workspace: dir,
+      repositories: [{ id: 'repo-1', path: 'group/app', name: 'repo' }] }) })
+    const host = new Commands(() => deployment, env, new AbortController().signal)
+    await host.pushQa('qa', sha, join(dir, 'repo'))
+    await host.pushQa('qa', second, join(dir, 'repo'))
+    await expect(host.pushQa('qa', sha, join(dir, 'repo'))).rejects.toThrow()
+    expect((await git('--git-dir', join(dir, 'remote.git'), 'rev-parse', 'refs/heads/qa')).stdout.trim()).toBe(second)
   })
   it('names the hooks directory in the environment, so a repository\'s own core.hooksPath cannot hide the push guard', async () => {
     const deployment = testDeployment({ stateDir: dir, github: undefined, codeup: testCodeup({ cli: program(join(dir, 'real', 'aliyun'), 'exit 0') }), feishu: undefined })

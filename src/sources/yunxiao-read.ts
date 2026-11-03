@@ -11,7 +11,7 @@ const COMMENTS_PER_PAGE = 20
 /** Related work items read per resource call, which bounds the calls one read makes; the rest are counted, not silently dropped. */
 const RELATED_READ = 10
 /** The CLI prints one JSON object; its fields are read by the normalizers, so the schema only checks the envelope. */
-const RESPONSE = z.looseObject({})
+const RESPONSE = z.union([z.looseObject({}), z.array(z.unknown())])
 /**
  * Yunxiao's requirement category, which is read as context only; a related task or bug is counted instead of read.
  * CALIBRATE: these are the OpenAPI's own identifiers, so a renamed category is changed here and nowhere else.

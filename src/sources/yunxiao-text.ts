@@ -218,6 +218,12 @@ function storedJsonml(text: string): unknown[] | undefined {
 export function richText(input: unknown): string {
   if (input === null || input === undefined) return ''
   if (typeof input === 'string') {
+    if (input.trim().startsWith('{')) {
+      try {
+        const value: unknown = JSON.parse(input)
+        if (value && typeof value === 'object' && ('htmlValue' in value || 'jsonMLValue' in value)) return richText(value)
+      } catch { /* A value that only looks like JSON remains plain text. */ }
+    }
     const jsonml = storedJsonml(input)
     if (jsonml) return tidy(renderNodes(jsonmlTree(jsonml), 0))
     return tidy(HTML_TAG.test(input) ? renderNodes(htmlTree(input), 0) : decodeEntities(input))
@@ -226,7 +232,7 @@ export function richText(input: unknown): string {
   if (typeof input === 'object') {
     const record = input as Record<string, unknown>
     // Editors wrap the body in an object whose key differs by field (`description`, `content`, `html`).
-    const nested = record.html ?? record.text ?? record.content ?? record.jsonml ?? record.value
+    const nested = record.htmlValue ?? record.jsonMLValue ?? record.html ?? record.text ?? record.content ?? record.jsonml ?? record.value
     return nested === undefined ? '' : richText(nested)
   }
   return tidy(String(input))

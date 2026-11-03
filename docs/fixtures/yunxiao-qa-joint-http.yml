@@ -1,0 +1,63 @@
+sources:
+  client_repo:
+    type: codeup
+    name: Client QA integrated version
+    endpoint: https://codeup.aliyun.com/62cf7f0b487c500c27f70f94/test-agent.git
+    branch: release/qa
+    cloneDepth: 0
+    certificate: &a1
+      type: serviceConnection
+      serviceConnection: ukcun8gmzmbayzkp
+  service_repo:
+    type: codeup
+    name: Service QA integrated version
+    endpoint: https://codeup.aliyun.com/62cf7f0b487c500c27f70f94/test-agent-service.git
+    branch: release/qa
+    cloneDepth: 0
+    certificate: *a1
+defaultWorkspace: client_repo
+stages:
+  joint:
+    name: Real cross-repository QA
+    jobs:
+      http:
+        name: Client to service HTTP flow
+        timeoutMinutes: 5
+        runsOn:
+          group: public/cn-beijing
+          container: build-steps-public-registry.cn-beijing.cr.aliyuncs.com/build-steps/alinux3:latest
+        steps:
+          check:
+            name: Verify exact versions and real API compatibility
+            step: Command
+            with:
+              run: |
+                set -eu
+                export CLIENT_QA_DIR="${WORK_SPACE:?}/client_repo"
+                export SERVICE_QA_DIR="${WORK_SPACE:?}/service_repo"
+                client_head=$(git -C "$CLIENT_QA_DIR" rev-parse HEAD)
+                service_head=$(git -C "$SERVICE_QA_DIR" rev-parse HEAD)
+                echo "JOINT_QA_VERSIONS client=$client_head service=$service_head"
+                python3 - <<'PYTEST'
+                import importlib.util, json, os, sys, threading, urllib.request
+                from urllib.error import HTTPError
+                sys.path.insert(0, os.environ['SERVICE_QA_DIR'])
+                import app
+                spec = importlib.util.spec_from_file_location('delivered_client', os.path.join(os.environ['CLIENT_QA_DIR'], 'client.py'))
+                client = importlib.util.module_from_spec(spec)
+                spec.loader.exec_module(client)
+                with app.make_server() as server:
+                    threading.Thread(target=server.serve_forever, daemon=True).start()
+                    base = 'http://127.0.0.1:%s' % server.server_port
+                    for name in ['qa user', '跨仓库']:
+                        result = client.fetch_greeting(base, name)
+                        assert result == {'message': 'hello ' + name, 'protocol': client.PROTOCOL_VERSION}, result
+                        print('JOINT_QA_HTTP_200 ' + json.dumps(result))
+                    try:
+                        urllib.request.urlopen(base + '/missing')
+                        raise AssertionError('unknown route must return 404')
+                    except HTTPError as error:
+                        assert error.code == 404
+                        print('JOINT_QA_HTTP_404 unknown route rejected')
+                print('JOINT_QA_COMPATIBILITY_PASS: client and service from fixed QA branches')
+                PYTEST

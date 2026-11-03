@@ -1,17 +1,16 @@
 /**
  * The yunxiao work-item Source: receiving rules read from a YAML file, the polling loop that turns assigned work items and
- * their comments into Triggers, the approver's question before a triage project's work starts, the status moves that follow a
- * ticket, the write-back of ended tickets, and the Cordis plugin entry.
+ * their comments into Triggers, the status moves that follow a ticket, the write-back of ended tickets, and the Cordis plugin
+ * entry.
  */
 import type { Context } from '@deepseek-ai/cordis'
 import { z } from 'zod'
-import { key, type ChannelRef, type Ticket } from '../core/index.ts'
+import type { ChannelRef, Ticket } from '../core/index.ts'
 import { KV } from '../kv.ts'
 import type { Commands } from '../infra/commands.ts'
 import { writeWorkerPipelines } from '../infra/environment.ts'
 import { sameName } from '../infra/text.ts'
 import { AGENT_COMMENT, YUNXIAO } from '../infra/yunxiao.ts'
-import { createFeishuDirect } from './feishu-channel.ts'
 import { health, sourceContext, type SourceContext } from './host.ts'
 import type { Localized, SourceKind } from './kind.ts'
 import { cursorAt, pause } from './poll.ts'
@@ -21,8 +20,8 @@ import { sendYunxiao, workitemGone, yunxiaoLink } from './yunxiao-channel.ts'
 import { newMergeRound, pollMergeRequests } from './yunxiao-mr.ts'
 import { yunxiaoThreadContext } from './yunxiao-read.ts'
 import { writeBack } from './yunxiao-write.ts'
-import { SOURCE, TRIAGE_BARE, commentTrigger, commentsOf, isAgentComment, workitemOf, workitemTrigger, workitemTriggerId,
-  yunxiaoRef, type Workitem } from './yunxiao-trigger.ts'
+import { SOURCE, commentTrigger, commentsOf, isAgentComment, workitemOf, workitemTrigger, yunxiaoRef, type Workitem }
+  from './yunxiao-trigger.ts'
 
 /**
  * The account the Source acts as, learned from the deployment on its first round: an assignment to it is the request the
@@ -56,7 +55,7 @@ export function currentRules(): { file: YunxiaoFile; problem?: string } | undefi
 export const yunxiaoKind: SourceKind<YunxiaoConfig> = {
   kind: SOURCE,
   title: { zh: '云效工作项', en: 'Yunxiao work items' },
-  description: { zh: '接收云效 Projex 项目里指派给智能体的缺陷和任务，跟进已有工单的评论，工单开始时把工作项流转到处理中、结束时写回结果评论和状态。triage 项目先私聊审批人确认再开工。接收规则写在 YAML 文件里，每轮轮询前重新读取并校验。', en: 'Receives the defects and tasks of yunxiao Projex projects that are assigned to the agent, follows up the comments of open tickets, moves a work item to its started status when a ticket begins, and writes the result comment and status back when it ends. A triage project asks the approver in a direct message before work starts. The receiving rules live in a YAML file, reread and validated before every round.' },
+  description: { zh: '接收云效 Projex 项目里指派给智能体的缺陷和任务，跟进已有工单的评论，工单开始时把工作项流转到处理中、结束时写回结果评论和状态。triage 项目的指派交给评估判断是否需要人确认，direct 项目直接开工。接收规则写在 YAML 文件里，每轮轮询前重新读取并校验。', en: 'Receives the defects and tasks of yunxiao Projex projects that are assigned to the agent, follows up the comments of open tickets, moves a work item to its started status when a ticket begins, and writes the result comment and status back when it ends. An assignment in a triage project goes to the assessment, which decides whether a person must confirm it; a direct project starts the work. The receiving rules live in a YAML file, reread and validated before every round.' },
   schema: YunxiaoConfigSchema,
   fields: [
     { key: 'configPath', type: 'text', label: { zh: '接收规则文件', en: 'Receiving-rule file' },
@@ -73,7 +72,11 @@ export const yunxiaoKind: SourceKind<YunxiaoConfig> = {
     // Only the poller emits these Triggers, and only for projects it read from the file, so an unnamed project is listened to
     // rather than dropped: before the first read there is no file in memory to check against.
     if (!projectId || !rules) return { listened: true, observed: false, ...(projectId ? { row: projectId } : {}) }
-    return projectOf(rules.file, projectId) ? { listened: true, observed: false, row: projectId } : { listened: false, reason: 'project_not_configured' }
+    if (!projectOf(rules.file, projectId)) return { listened: false, reason: 'project_not_configured' }
+    // A triage project's assignment is not addressed to the agent: the Source says it observed that work item itself, which is
+    // what lets the Policy's admission table decide whether the assignment becomes an inferred candidate for the assessment.
+    // A comment, and a direct project's assignment, address the agent or only follow a ticket up, so they observe nothing.
+    return { listened: true, observed: meta.triage === true, row: projectId }
   },
   channel: { send: sendYunxiao, link: yunxiaoLink },
   threadContext: yunxiaoThreadContext,
@@ -92,9 +95,10 @@ export const yunxiaoKind: SourceKind<YunxiaoConfig> = {
       if (!current) return []
       return current.projects.map(project => ({ id: project.id, label: project.id,
         note: project.intake === 'direct' ? { zh: '直接开工', en: 'Starts directly' } : { zh: '先评估', en: 'Assessed first' },
-        // Nothing here is inferred: the only entry is an assignment to an account on the list, which the gate admits as an
-        // explicit request, and a comment only follows up an existing ticket.
-        cells: { listedUnaddressed: false, unlistedAddressed: false, unlistedUnaddressed: false } }))
+        // A triage project's assignment is unaddressed and observed, so the admission table admits it as an inferred candidate;
+        // a direct project's is addressed and is the explicit request itself. A comment only follows up an existing ticket, and
+        // an unlisted account's assignment is not admitted either way.
+        cells: { listedUnaddressed: project.intake === 'triage', unlistedAddressed: false, unlistedUnaddressed: false } }))
     },
   },
   environment: {
@@ -102,7 +106,7 @@ export const yunxiaoKind: SourceKind<YunxiaoConfig> = {
       { key: 'DSH_SUPERAGENT_YUNXIAO_WORKITEM', description: { zh: '接单的工作项 id；工单不是从云效来的时为空', en: 'Id of the work item that started the ticket; empty when the ticket did not start on Yunxiao' } },
       { key: 'DSH_SUPERAGENT_YUNXIAO_SERIAL', description: { zh: '工作项编号，如 AXOAXO-6812；工单不是从云效来的时为空', en: 'Serial of the work item, such as AXOAXO-6812; empty when the ticket did not start on Yunxiao' } },
       { key: 'DSH_SUPERAGENT_YUNXIAO_URL', description: { zh: '工作项的网页链接；工单不是从云效来的时为空', en: 'Web address of the work item; empty when the ticket did not start on Yunxiao' } },
-      { key: 'DSH_SUPERAGENT_YUNXIAO_CATEGORY', description: { zh: 'Bug 或 Task，决定分支用 bugfix/ 还是 feat/；工单不是从云效来的时为空', en: 'Bug or Task, which decides whether the branch is bugfix/ or feat/; empty when the ticket did not start on Yunxiao' } },
+      { key: 'DSH_SUPERAGENT_YUNXIAO_CATEGORY', description: { zh: '类别 Bug 或 Task；开发分支均为无前缀的工作项编号；非云效工单为空', en: 'Bug or Task; both use the bare work-item serial as development branch; empty for non-Yunxiao tickets' } },
     ],
     values: ({ trigger }) => {
       const yunxiao = trigger?.source === SOURCE
@@ -209,9 +213,6 @@ export async function pollRound(ctx: SourceContext, signal?: AbortSignal): Promi
   if (!problem) await syncPipelines(ctx, round, file)
   await pollWorkitems(ctx, round, file, agent)
   const searched = !round.failures.length
-  // The approver answers after the round that asked, by which time the cursor has moved past the work item's last change:
-  // the answers are read from their own records rather than from the search window, or a late answer would start nothing.
-  await pollTriageAnswers(ctx, round, file, agent)
   await pollStarted(ctx, round, file)
   await pollComments(ctx, round, file, agent)
   // Merge requests the tickets of this Source follow: their comments, CI and close, each read on its own.
@@ -353,83 +354,28 @@ async function intake(ctx: SourceContext, round: Round, file: YunxiaoFile, proje
   if (wasAssigned && !assigned) await stopReassigned(ctx, round, file, item)
   // Started before the state is recorded, so a Trigger the Engine refused is emitted again by the next round rather than
   // recorded as granted; the Trigger ID is the same, so an Engine that did take it answers `duplicate`.
-  if (grant) await startWork(ctx, round, file, project, item, agent, cycle)
+  if (grant) await startWork(ctx, file, project, item, agent, cycle)
   ctx.state.set(KV.yunxiao.workitem(item.id), { cycle, status: item.status, assignee: item.assignee, commentAt: previous?.commentAt ?? '' })
 }
 /**
- * Starts the repair cycle of one work item: directly for a `direct` project, and only after the approver's answer for a
- * `triage` one, where the design lets a person decide before a worker is started.
+ * Hands the repair cycle of one work item to the Engine. A direct project's assignment is the request itself; a triage
+ * project's is a candidate the assessment decides on, asking a person when the work turns out to need one.
  */
-async function startWork(ctx: SourceContext, round: Round, file: YunxiaoFile, project: YunxiaoProject, item: Workitem,
-  agent: string, cycle: number): Promise<void> {
-  if (project.intake === 'direct') {
-    await ctx.receive(workitemTrigger(item, item.assignee, cycle, agent, intakeChannel(file)))
-    return
-  }
-  await askTriage(ctx, round, file, item, agent, cycle)
-}
-/**
- * Asks the approver, in a direct message, whether a triage project's work item should start. The question is asked once per
- * repair cycle; the answer arrives in `KV.yunxiao.triage`, written by the host that reads the approver's reply.
- */
-async function askTriage(ctx: SourceContext, round: Round, file: YunxiaoFile, item: Workitem, agent: string, cycle: number): Promise<void> {
-  const asked = ctx.state.get(KV.yunxiao.triage(item.id))
-  // A question for this cycle is out, or already answered: `answeredTriage` takes it from there.
-  if (asked && asked.cycle === cycle) return
-  const openId = file.approver.feishuOpenId
-  if (!openId) {
-    // Nobody to ask: the design's simple case starts the work at once, and health says the question was skipped for want of
-    // an approver, so an operator can name one instead of wondering why triage never asks.
-    round.problems.push(`triage of ${item.id}: the receiving rules name no approver.feishuOpenId, so the work item started without a question`)
-    await ctx.receive(workitemTrigger(item, item.assignee, cycle, agent, intakeChannel(file)))
-    return
-  }
-  // The question's idempotency key is fixed by the work item and its cycle, so a round that retries after a lost answer sends
-  // one message rather than two.
-  const idempotencyKey = key('yunxiao-triage', item.id, String(cycle))
-  const messageId = await createFeishuDirect(ctx.commands.withSignal(round.signal), { openId, text: triageText(item), idempotencyKey })
-  if (!messageId) throw new Error('Feishu reported no message id for the triage question')
-  ctx.state.set(KV.yunxiao.triage(item.id), { state: 'asked', messageId, at: round.started, cycle })
-  // The host reads the approver's answer through this record, which names the work item the question asks about.
-  ctx.state.set(KV.merge.message(messageId), { thread: '', ticketId: '', at: round.started, kind: 'triage', workitemId: item.id })
-}
-/**
- * Starts the work of every triage project whose approver answered `go` and whose cycle has no Trigger yet.
- * The answer is read from its own record rather than from a search result: a work item that nobody touches again never
- * returns to the modification window the cursor has already passed, so waiting for the search would leave it unstarted
- * although the approver was told it began. The work item is read again before starting, because it may have been assigned
- * away or closed while the question waited; then nothing starts and the answer is spent rather than asked again.
- */
-async function pollTriageAnswers(ctx: SourceContext, round: Round, file: YunxiaoFile, agent: string): Promise<void> {
-  const commands = ctx.commands.withSignal(round.signal)
-  for (const key of ctx.state.keys(KV.yunxiao.triage)) {
-    if (stopped(ctx, round)) return
-    const asked = ctx.state.get(key)
-    if (!asked || asked.state !== 'go') continue
-    const id = key.slice(KV.yunxiao.triage.prefix.length)
-    if (!id || ctx.triggers.get(workitemTriggerId(id, asked.cycle))) continue
-    try {
-      const item = workitemOf(await commands.aliyun(z.unknown(), YUNXIAO.workitem(file.organization, id)))
-      const project = projectOf(file, item.projectId)
-      const assigned = agent !== '' && sameName(item.assignee, agent)
-      // The state the answer was given for may be gone: a person's "start" is spent rather than replayed on a work item that
-      // is now somebody else's or no longer waiting to be worked on.
-      if (!project || !assigned || !receiveStates(project).includes(item.status)) { ctx.state.set(key, undefined); continue }
-      const trigger = workitemTrigger(item, item.assignee, asked.cycle, agent, intakeChannel(file))
-      // An answer that says more than "go" is material the worker should read, so it rides on the Trigger that starts the work.
-      const answer = asked.answer?.trim() ?? ''
-      if (answer && !TRIAGE_BARE.test(answer)) trigger.text = `${trigger.text}\n\n补充信息（审批人）：${answer}`
-      await ctx.receive(trigger)
-    } catch (error) {
-      if (stopped(ctx, round)) return
-      // A work item that is gone takes no work ever: the answer is spent and named once, so no round asks for it again. Any
-      // other failure may pass, and dropping the answer would lose the start the approver was promised, so it is kept and the
-      // round reports the failed read instead.
-      if (!workitemGone(error)) { round.failures.push(`triage answer of ${id}: ${String(error)}`); continue }
-      ctx.state.set(key, undefined)
-      round.problems.push(`triage answer of ${id}: ${String(error)}`)
+async function startWork(ctx: SourceContext, file: YunxiaoFile, project: YunxiaoProject, item: Workitem, agent: string,
+  cycle: number): Promise<void> {
+  const trigger = workitemTrigger(item, item.assignee, cycle, agent,
+    { channel: intakeChannel(file), triage: project.intake === 'triage' })
+  // Invalidate before receive can resume the worker; retries of an accepted cycle keep its new evidence.
+  if (!ctx.triggers.get(trigger.id)) ctx.atomic(() => {
+    const ids = new Set([...(ctx.threads.get(`${SOURCE}:wi:${item.id}`)?.subscriptions ?? []), ...ctx.tickets.open().map(ticket => ticket.id)])
+    for (const id of ids) {
+      const ticket = ctx.tickets.get(id), origin = ticket && ctx.triggers.get(ticket.origin.triggerId)
+      if (origin?.source !== SOURCE || yunxiaoRef(origin).workitemId !== item.id) continue
+      ctx.state.set(KV.yunxiao.qaPlan(id), undefined)
+      ctx.state.set(KV.yunxiao.qaTest(id), undefined)
     }
-  }
+  })
+  await ctx.receive(trigger)
 }
 /**
  * Ends the ticket a work item started once the work item is assigned to somebody else, and says so on the work item. The
@@ -461,11 +407,6 @@ async function pollStarted(ctx: SourceContext, round: Round, file: YunxiaoFile):
     const cycle = ctx.state.get(KV.yunxiao.workitem(id))?.cycle ?? 0
     const moved = ctx.state.get(KV.yunxiao.started(ticket.id))
     if (moved && moved.cycle === cycle) continue
-    // The start of this cycle is still the approver's to give: a question is out, or the answer is on its way but the Trigger
-    // that carries it is not stored yet. Moving the status first would leave the answer finding a work item that no longer
-    // waits for work, and the start would be dropped.
-    const asked = ctx.state.get(KV.yunxiao.triage(id))
-    if (asked && asked.cycle === cycle && asked.state !== 'declined' && !ctx.triggers.get(workitemTriggerId(id, cycle))) continue
     const type = startedRuleOf(ctx, file, ticket)
     if (!type) continue
     try {
@@ -498,16 +439,6 @@ function openTicketOf(ctx: SourceContext, workitemId: string): Ticket | undefine
 function intakeChannel(file: YunxiaoFile): ChannelRef | undefined {
   const openId = file.approver.feishuOpenId
   return openId ? { source: 'feishu', thread: `feishu:dm:${openId}`, address: { openId, new: 'true' } } : undefined
-}
-/**
- * The question the approver answers before a triage project's work item starts: what the work item is, where to read it, and
- * how to answer. Like the merge confirmation, it is user-facing copy in the team's language.
- */
-export function triageText(item: Workitem): string {
-  const whole = item.description.replace(/\s+/g, ' ').trim()
-  const excerpt = whole.length > 300 ? `${whole.slice(0, 300)}…` : whole
-  return [['【开工确认】', item.serial, item.title].filter(Boolean).join(' '), ...excerpt ? ['', excerpt] : [],
-    ...item.url ? ['', item.url] : [], '', '回复「开工」开始处理；回复「不做」跳过；其他文字视为补充信息并开工。'].join('\n')
 }
 /**
  * Applies the rules file's pipeline prefixes to the file a worker's shell reads, so a worker may start exactly the pipelines
