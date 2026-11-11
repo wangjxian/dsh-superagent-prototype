@@ -1050,6 +1050,27 @@ describe('replies', () => {
   })
 })
 describe('ticket commands', () => {
+  it('binds a change request for its messages only: its merge leaves the ticket to its ready report', () => {
+    const h = harness()
+    const ticketId = accepted(h).ticketId!
+    // A change request binds without ending, so its merge ends nothing; the Ticket still follows it for a person's messages.
+    h.engine.bindThread(ticketId, { source: 'yunxiao', id: 'mr:repo-1:7' }, true, false)
+    h.engine.threadClosed({ source: 'yunxiao', id: 'mr:repo-1:7' }, 'merged', '2026-09-23T00:00:00Z')
+    expect(h.repo.tickets.get(ticketId)!.ended).toBeUndefined()
+    // Its ready report ends it as completed, and the merged change stays on the Ticket as what happened.
+    h.engine.report(ticketId, { state: 'ready', summary: 'Verified on PRE' })
+    expect(h.repo.tickets.get(ticketId)!.ended).toMatchObject({ outcome: 'completed' })
+    expect(h.repo.tickets.get(ticketId)!.follows).toEqual([{ thread: 'yunxiao:mr:repo-1:7', own: true, ends: false,
+      closed: { at: '2026-09-23T00:00:00.000Z', outcome: 'merged' } }])
+    // A Ticket that also follows an ending Thread still waits for it, as it did before.
+    const other = accepted(h, '3', 't3').ticketId!
+    h.engine.bindThread(other, { source: 'yunxiao', id: 'mr:repo-1:8' }, true, false)
+    h.engine.bindThread(other, { source: 'gh', id: 'pr-9' }, true)
+    h.engine.report(other, { state: 'ready', summary: 'Done' })
+    expect(h.repo.tickets.get(other)).not.toHaveProperty('ended')
+    h.engine.threadClosed({ source: 'gh', id: 'pr-9' }, 'merged', '2026-09-23T00:01:00Z')
+    expect(h.repo.tickets.get(other)!.ended).toMatchObject({ outcome: 'merged' })
+  })
   it('ends a ticket by the same rule on a close and on a ready report: once no PR it opened is open, as the latest of them ended', () => {
     const h = harness()
     const ticketId = accepted(h).ticketId!

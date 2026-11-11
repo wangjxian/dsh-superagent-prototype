@@ -1,6 +1,7 @@
 import { describe, expect, it, vi } from 'vitest'
 import { z } from 'zod'
 import { CliError, Commands, commandError } from '../src/infra/commands.ts'
+import { YUNXIAO } from '../src/infra/yunxiao.ts'
 import { feishuKind } from '../src/sources/feishu.ts'
 import { feishuChannel } from '../src/sources/feishu-trigger.ts'
 import { githubKind } from '../src/sources/github.ts'
@@ -8,14 +9,31 @@ import { githubChannel } from '../src/sources/github-trigger.ts'
 import { SourceRegistry } from '../src/sources/registry.ts'
 import { SettingsSchema } from '../src/policy.ts'
 import { key, type OutboundMessage } from '../src/core/index.ts'
-import { testDeployment } from './fixtures/deployment.ts'
+import { testCodeup, testDeployment } from './fixtures/deployment.ts'
 const sources = new SourceRegistry(() => SettingsSchema.parse({}))
 sources.register(feishuKind); sources.register(githubKind)
 const send = (commands: Commands, message: OutboundMessage) => sources.send(message, commands)
-const deployment = testDeployment({ github: { ...testDeployment().github, cli: '/path/agent-gh' } })
+const deployment = testDeployment({ github: { cli: '/path/agent-gh', login: 'agent-bot', noreply: '7+agent-bot@users.noreply.github.com' } })
 const REPOSITORY = deployment.repository
 const reply = { id: 'stable-operation', channel: githubChannel(8), text: 'Done', kind: 'reply' as const }
 describe('account-isolated operations', () => {
+  it('limits host QA publication to a configured non-trunk branch and bypasses hooks explicitly without force', async () => {
+    const configured = testDeployment({ github: undefined, codeup: testCodeup({
+      repositories: [{ id: 'repo-1', path: 'group/app', name: 'app', defaultBranch: 'trunk' }],
+    }) })
+    const commands = new Commands(() => configured, {}, new AbortController().signal)
+    const git = vi.spyOn(commands, 'git').mockResolvedValue('')
+    const sha = 'a'.repeat(40), directory = '/tmp/dsh-superagent-workspace/app'
+    for (const branch of ['master', 'main', 'trunk', '-qa']) await expect(commands.pushQa(branch, sha, directory)).rejects.toThrow('Invalid host QA publication')
+    await expect(commands.pushQa('qa', sha, '/elsewhere/app')).rejects.toThrow('Invalid host QA publication')
+    await expect(commands.pushQa('qa', 'not-a-commit', directory)).rejects.toThrow('Invalid host QA publication')
+    expect(git).not.toHaveBeenCalled()
+    await commands.pushQa('qa', sha, directory)
+    expect(git.mock.calls).toEqual([
+      [['check-ref-format', '--branch', 'qa'], directory],
+      [['push', '--no-verify', 'origin', `${sha}:refs/heads/qa`], directory],
+    ])
+  })
   it('uses the agent account\'s GitHub CLI and preserves literal shell metacharacters in argv', async () => {
     const commands = new Commands(() => deployment, {}, new AbortController().signal); const run = vi.spyOn(commands,'run').mockResolvedValue('{}')
     await commands.gh(['api','some-path','-f','body=`whoami` $(touch x)'])
@@ -212,4 +230,71 @@ it('stops a running command when the signal of its work aborts, or the lifetime,
   lifetime.abort()
   await expect(other).rejects.toThrow()
   expect(Date.now() - started).toBeLessThan(4000)
+})
+
+describe('yunxiao calls', () => {
+  const codeup = testCodeup({ cli: '/path/agent-aliyun' })
+  const codeupOnly = testDeployment({ github: undefined, codeup })
+  const commands = () => new Commands(() => codeupOnly, {}, new AbortController().signal)
+  const change = YUNXIAO.changeRequest('org-1', 'repo-1', 3)
+  /** A yunxiao failure as the CLI prints it: an HTTP status line, then the report's data. */
+  const failed = (status: number, message = 'boom') =>
+    commandError({ stderr: `StatusCode: ${status}\nData: {"message":"${message}"}\n`, code: 1 })
+  it('runs the CLI through a shell that reads the keychain token, which dsh-superagent never holds in its own environment', async () => {
+    const value = commands()
+    const run = vi.spyOn(value, 'run').mockResolvedValue('log line\n{"localId":3}\n')
+    expect(await value.aliyun(z.looseObject({ localId: z.number() }), change)).toEqual({ localId: 3 })
+    const [program, argv, cwd, label] = run.mock.calls[0]!
+    expect({ program, cwd, label }).toEqual({ program: 'sh', cwd: undefined, label: 'aliyun' })
+    expect(argv?.[0]).toBe('-c')
+    const script = argv?.[1] ?? ''
+    // The token is read in the shell that execs the CLI, so no environment dsh-superagent or a worker keeps holds it.
+    expect(script).toContain(`/usr/bin/security find-generic-password -s 'dsh-superagent-yunxiao' -w`)
+    expect(script).toContain('export ALIBABA_CLOUD_YUNXIAO_ACCESS_TOKEN="$token"')
+    expect(script).toContain(`exec '/path/agent-aliyun' 'devops' 'codeup-get-change-request' '--organization-id' 'org-1'`)
+    // Without a schema, the raw output comes back untouched.
+    expect(await value.aliyun(change)).toBe('log line\n{"localId":3}\n')
+  })
+  it.each(['[]', '[{"id":"wi-1"}]', 'CLI banner\n[{"id":"wi-1"}]'])('reads a top-level JSON array: %s', async output => {
+    const value = commands()
+    vi.spyOn(value, 'run').mockResolvedValue(output)
+    expect(await value.aliyun(z.array(z.object({ id: z.string() })), YUNXIAO.workitemComments('org-1', 'wi-1')))
+      .toEqual(output.includes('wi-1') ? [{ id: 'wi-1' }] : [])
+  })
+  it('reports a yunxiao failure with the HTTP status the CLI names and its message', async () => {
+    const value = commands()
+    const run = vi.spyOn(value, 'run').mockRejectedValue(failed(404, 'the merge request does not exist'))
+    await expect(value.aliyun(change)).rejects.toMatchObject({ message: 'the merge request does not exist', code: 404, exitCode: 1 })
+    // A call that prints no status line keeps the CLI's own diagnostics, so a signed-out token stays readable.
+    run.mockReset().mockRejectedValue(commandError({ stderr: 'InvalidAccessKeyId.NotFound', code: 1 }))
+    await expect(value.aliyun(change)).rejects.toMatchObject({ message: 'InvalidAccessKeyId.NotFound', code: undefined })
+  })
+  it('retries a read-only call that failed with a 5xx or never reached the service, and never retries a write', async () => {
+    const value = commands()
+    const run = vi.spyOn(value, 'run').mockRejectedValueOnce(failed(500))
+      .mockRejectedValueOnce(commandError({ stderr: 'dial tcp 10.0.0.1:443: i/o timeout', code: 1 })).mockResolvedValue('{"id":"user-1"}')
+    await expect(value.aliyun(YUNXIAO.user())).resolves.toBe('{"id":"user-1"}')
+    expect(run).toHaveBeenCalledTimes(3)
+    // A 4xx is the service's answer, not a transient failure: the same call would fail again.
+    run.mockReset().mockRejectedValue(failed(404))
+    await expect(value.aliyun(YUNXIAO.user())).rejects.toMatchObject({ code: 404 })
+    expect(run).toHaveBeenCalledTimes(1)
+    // A merge request or a comment may exist after a failed write, so only the caller decides whether to try again.
+    run.mockReset().mockRejectedValue(failed(503))
+    await expect(value.aliyun(['devops', 'codeup-create-change-request', '--organization-id', 'org-1'])).rejects.toMatchObject({ code: 503 })
+    expect(run).toHaveBeenCalledTimes(1)
+    // A read that keeps failing reports the last answer after its attempts.
+    run.mockReset().mockRejectedValue(failed(503))
+    await expect(value.aliyun(YUNXIAO.user())).rejects.toMatchObject({ code: 503 })
+    expect(run).toHaveBeenCalledTimes(3)
+  })
+  it('names the account each platform call needs when the installation has no account for it', async () => {
+    const githubOnly = new Commands(() => testDeployment(), {}, new AbortController().signal)
+    await expect(githubOnly.aliyun(YUNXIAO.user())).rejects.toThrow('This installation has no Codeup account; configure the Codeup Source or use the GitHub account')
+    const message = 'This installation has no GitHub account; configure the GitHub Source or use the Codeup account'
+    const codeupOnlyCommands = commands()
+    await expect(codeupOnlyCommands.gh(['api', 'user'])).rejects.toThrow(message)
+    await expect(codeupOnlyCommands.api(z.unknown(), 'issues/1')).rejects.toThrow(message)
+    await expect(codeupOnlyCommands.pages(z.unknown(), 'issues/1/comments')).rejects.toThrow(message)
+  })
 })

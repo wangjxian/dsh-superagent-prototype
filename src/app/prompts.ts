@@ -23,7 +23,7 @@ const SkillNameSchema = z.string().regex(SKILL_NAME).refine(name => !(Object.key
 /** The built-in parts a team may override, by key: both roles' parts, the Source skills, and the generated parts' templates. */
 const PART_KEYS = ['runtime/shared', 'runtime/orchestrator', 'runtime/worker', 'runtime/subscriptions', 'runtime/replies',
   'runtime/dispatch', 'runtime/work', 'runtime/admission', 'runtime/handoff/orchestrator', 'runtime/handoff/worker', 'runtime/environment',
-  'runtime/policy', 'runtime/policy/none', 'skill/feishu', 'skill/github'] as const
+  'runtime/policy', 'runtime/policy/none', 'skill/feishu', 'skill/github', 'skill/codeup', 'skill/yunxiao'] as const
 export type PartKey = typeof PART_KEYS[number]
 /** A team's text for a built-in part, and `base`, the key of the built-in text it was edited from. */
 const OverrideSchema = z.object({ text: z.string(),
@@ -49,8 +49,8 @@ interface BuiltInPart { roles: readonly Role[]; text: string; placeholders?: rea
 const BOTH: readonly Role[] = ['orchestrator', 'worker'], MAIN: readonly Role[] = ['orchestrator'], WORKER: readonly Role[] = ['worker']
 let parts: Readonly<Record<PartKey, BuiltInPart>> | undefined
 /**
- * The built-in parts of both roles' prompts, the two Source skills, and the templates of the generated parts, whose data the
- * system fills in, by the key an override names them by. Built on first use, as the texts it reads are imported in a cycle.
+ * The built-in parts of both roles' prompts, one Source skill per platform, and the templates of the generated parts, whose data
+ * the system fills in, by the key an override names them by. Built on first use, as the texts it reads are imported in a cycle.
  */
 export const builtInParts = (): Readonly<Record<PartKey, BuiltInPart>> => parts ??= {
   'runtime/shared': { roles: BOTH, text: sharedPrompt }, 'runtime/orchestrator': { roles: MAIN, text: masterPrompt },
@@ -67,6 +67,10 @@ export const builtInParts = (): Readonly<Record<PartKey, BuiltInPart>> => parts 
     placeholders: ['{version}', '{mode}'] },
   'skill/feishu': { roles: BOTH, text: `${sourceSkills.feishu}\n\n## CLI usage\n${cliNotes}` },
   'skill/github': { roles: BOTH, text: `${sourceSkills.github}\n\n## CLI usage\n${cliNotes}` },
+  // The Codeup skill carries its own CLI usage: the notes above describe gh and lark-cli, which a Codeup deployment need not have.
+  'skill/codeup': { roles: BOTH, text: sourceSkills.codeup },
+  // The yunxiao skill describes the work item's material and the result the host writes back, not a CLI the worker calls.
+  'skill/yunxiao': { roles: BOTH, text: sourceSkills.yunxiao },
 }
 /** The key of a built-in text, which an override's `base` records. */
 export const builtInBase = (text: string): string => key('prompt-built-in', text)
@@ -118,7 +122,7 @@ export function composePrompt(config: PromptConfig, role: Role, environment?: st
   return promptParts(config, role, environment, policy).map(part => part.text).join('\n\n')
 }
 export function composeSkill(config: PromptConfig, name: string): string {
-  return name === 'feishu' || name === 'github' ? builtIn(config, `skill/${name}`) : config.skills[name] ?? ''
+  return name === 'feishu' || name === 'github' || name === 'codeup' || name === 'yunxiao' ? builtIn(config, `skill/${name}`) : config.skills[name] ?? ''
 }
 
 /** An override whose built-in text changed since its `base`, with that text when kept, or whose part this version no longer has. */
@@ -128,6 +132,10 @@ export interface DefaultChange { part: string; base?: string; previous?: string;
  * Thrown by `Prompts.save` and translated into an HTTP 409 response by the management routes.
  */
 export class PromptConflict extends Error {}
+/** The platforms a deployment may be configured for; each one's built-in skill registers only when it is. */
+export interface Platforms { github: boolean; codeup: boolean; feishu: boolean; yunxiao: boolean }
+/** The built-in skills in the order Sessions register them, named for the platform each belongs to. */
+const PLATFORM_SKILLS = ['feishu', 'github', 'codeup', 'yunxiao'] as const satisfies readonly (keyof Platforms)[]
 /**
  * Stores numbered prompt configurations in `Store` via `Versions` and composes role system prompts and skills with the execution environment.
  * `Sessions` reads the composed prompts and skills for orchestrator and worker runs, while management routes and tools validate, preview, and save revisions through it.
@@ -135,16 +143,17 @@ export class PromptConflict extends Error {}
 export class Prompts {
   private readonly versions: Versions<PromptVersion>
   constructor(private readonly store: Store, private readonly maxChars: () => number, private readonly environment: () => Variable[] | undefined,
-    private readonly feishu: () => boolean) {
+    private readonly platforms: () => Platforms) {
     this.versions = new Versions(store, KV.prompts.revision, KV.prompts.version)
   }
   /** A role's prompt; the main Session's Policy section follows the settings as they are now, at each model request. */
   compose(config: PromptConfig, role: Role, variables = this.environment()): string {
     return composePrompt(config, role, environmentSection(config, variables), role === 'orchestrator' ? policySection(this.store.settings(), config) : undefined)
   }
-  /** Returns skills to register in every Session: built-in Source skills (`feishu` only when a Feishu bot is configured) followed by team skills. */
+  /** Returns skills to register in every Session: the built-in skill of each configured platform, followed by team skills. */
   skills(config: PromptConfig): [string, string][] {
-    return [...this.feishu() ? ['feishu'] : [], 'github', ...Object.keys(config.skills)].map(name => [name, composeSkill(config, name)])
+    const platforms = this.platforms()
+    return [...PLATFORM_SKILLS.filter(name => platforms[name]), ...Object.keys(config.skills)].map(name => [name, composeSkill(config, name)])
   }
   current(): PromptVersion {
     const revision = this.versions.revision()

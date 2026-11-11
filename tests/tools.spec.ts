@@ -2,11 +2,15 @@
 import { afterEach, beforeEach, expect, it, vi } from 'vitest'
 import { TICKET_STATES } from '../src/app/cards.ts'
 import { builtInBase, builtInParts, defaultPrompts } from '../src/app/prompts.ts'
-import { UserError } from '../src/core/index.ts'
+import { RESOURCES, type ResourceHost } from '../src/app/resources.ts'
+import { executorTools, type ExecutorToolsHost } from '../src/app/tools/executor.ts'
+import * as qaTools from '../src/app/qa.ts'
+import { threadKey, UserError, type Ticket, type ThreadRef } from '../src/core/index.ts'
 import { KV } from '../src/kv.ts'
-import { RESOURCES } from '../src/app/resources.ts'
 import { CliError, Commands } from '../src/infra/commands.ts'
 import { IM_WORDS, NOTE_WORDS } from '../src/infra/text.ts'
+import type { SourceContext } from '../src/sources/host.ts'
+import { testCodeup, testDeployment } from './fixtures/deployment.ts'
 import { CHAT, feishu, startRuntime, type Host } from './fixtures/host.ts'
 
 let h: Host
@@ -415,6 +419,186 @@ it('relays a worker\'s report with its ticket card and the start of its summary,
   expect(report.ticket).not.toHaveProperty('preview')
   // The end of the ticket, which the ready report brought, comes with its card.
   expect(notices().at(-1)).toMatchObject({ ticket_ended: { ticket_id: ticket.id, state: 'completed' } })
+})
+
+it('binds each change a report names to the ticket through the hosting platform, and keeps the report\'s result', async () => {
+  const { ticket, sessionId } = await h.acceptedTicket(feishu('1', '@bot 修一下回归'))
+  // The ticket's own branch is the one named after its worktree, which the accept named after the ticket.
+  const pull = { number: 12, state: 'open', html_url: 'https://github.com/acme/widgets/pull/12', title: 'Fix the regression',
+    user: { login: 'agent-bot' }, head: { ref: `bugfix/261102-${ticket.execution!.name}`, sha: 'abc' }, base: { ref: 'release/20261101' } }
+  vi.mocked(Commands.prototype.gh).mockImplementation(async args => {
+    if (args[1]?.includes('/pulls/99')) return { ...pull, number: 99, user: { login: 'carol' } }
+    return args[1]?.includes('/pulls/') ? pull : { default_branch: 'master', permissions: { push: true } }
+  })
+  const report = (changes: unknown[]) => h.runTool(sessionId, 'orchestrator_report',
+    { state: 'progress', summary: 'Opened the pull request.', changes, result: { status: 'fixed', root_cause: 'stale cache' } })
+  // A change by another account is refused rather than recorded, so the report leaves nothing behind.
+  await expect(report([{ repository: 'acme/widgets', localId: 99 }])).rejects.toThrow('does not belong')
+  expect(h.runtime.store.tickets.get(ticket.id)!.follows ?? []).toEqual([])
+  expect(await report([{ repository: 'acme/widgets', localId: 12 }])).toEqual({ reported: true, notification: 'internal_only' })
+  const stored = h.runtime.store.tickets.get(ticket.id)!
+  expect(stored.follows).toEqual([{ thread: 'github:12', own: true }])
+  expect(h.runtime.store.threads.get('github:12')?.meta).toMatchObject({ number: 12, isPr: true, url: pull.html_url, prAuthor: 'agent-bot' })
+  expect(stored.assignments.at(-1)!.report).toMatchObject({ state: 'progress', result: { status: 'fixed', root_cause: 'stale cache' } })
+  // A GitHub deployment's worker reads no target-release tool at all: pull requests target a branch a person names.
+  await expect(h.runTool(sessionId, 'orchestrator_codeup_target', {})).rejects.toThrow('is not registered')
+})
+
+it('follows a reported merge request for context where a change does not end its ticket, and computes the target release', async () => {
+  const codeup = testCodeup()
+  const deployment = testDeployment({ github: undefined, codeup, repository: '' })
+  const merge = { localId: 7, title: 'Fix the regression', sourceBranch: 'bugfix/261102-fix-7', targetBranch: 'release/20261101',
+    status: 'UNDER_REVIEW', detailUrl: 'https://codeup.aliyun.com/org-1/group/app/change/7', author: { userId: 'user-1', id: 881811 } }
+  const patchSets = [{ patchSetBizId: 'ps-1', relatedMergeItemType: 'MERGE_SOURCE', commitId: 'a'.repeat(40), versionNo: 1 }]
+  const calls: string[][] = []
+  const commands = { withSignal: () => commands, aliyun: async (first: unknown, second?: readonly string[]) => {
+    const argv = second ?? first as readonly string[]
+    calls.push([...argv])
+    // The typed overload hands back the record the CLI printed, which the caller validates; the plain one hands back its text.
+    if (second) return argv[1] === 'codeup-list-change-request-patch-sets' ? patchSets : merge
+    if (argv[1] === 'codeup-list-branches') return JSON.stringify({ result: [{ name: 'release/20261101' }] })
+    if (argv[1] === 'codeup-get-compare') return '{"aheadBy":2}'
+    throw new Error(`unexpected yunxiao call: ${argv.join(' ')}`)
+  } } as unknown as Commands
+  const ticket = { id: 'ticket-1', execution: { name: 'fix-7', directory: '/work/fix-7', assignment: '' },
+    origin: { triggerId: 'trigger-1', triggerIds: ['trigger-1'] }, follows: [] } as unknown as Ticket
+  const seen = { followed: [] as string[], bound: [] as { key: string; own: boolean; ends: boolean }[], patched: [] as Record<string, unknown>[],
+    reports: [] as Record<string, unknown>[] }
+  const context = { deployment, commands, ready: Promise.resolve(), configured: () => true, config: () => undefined,
+    receive: () => ({ queued: true }), atomic: <T>(work: () => T): T => work(), state: { get: () => undefined, set: () => {}, keys: () => [] },
+    threads: { get: () => undefined, subscribed: () => [], describe: () => {},
+      patch: (key: string, meta: Record<string, unknown>) => { seen.patched.push({ key, ...meta }) } },
+    tickets: { get: () => ticket, open: () => [ticket], threadClosed: () => {},
+      bindThread: (_id: string, thread: ThreadRef, own: boolean, ends?: boolean) => {
+        seen.bound.push({ key: threadKey(thread), own, ends: ends !== false })
+      } },
+    triggers: { get: () => undefined, latest: () => undefined }, notify: () => {}, report: () => {} } as unknown as SourceContext
+  const host = { engine: { report: (_id: string, report: Record<string, unknown>) => { seen.reports.push(report); return ticket },
+      followForContext: (_id: string, thread: ThreadRef) => { seen.followed.push(threadKey(thread)); return true },
+      reply: () => ({}), markUnrelated: () => {}, handback: () => false },
+    store: { tickets: context.tickets, replyStatus: () => undefined, atomic: <T>(work: () => T): T => work() },
+    sessions: { relay: () => {}, notify: () => {} }, resources: {} as unknown as ResourceHost,
+    source: context, sendReplies: async () => {} } as unknown as ExecutorToolsHost
+  const tools = executorTools(host, ticket)
+  const run = (name: string, args: unknown) => tools.find(item => item.name === name)!.execute(args, new AbortController().signal)
+  expect(await run('orchestrator_report', { state: 'progress', summary: 'Opened the merge request.', changes: [{ repository: 'repo-1', localId: 7 }] }))
+    .toEqual({ reported: true, notification: 'internal_only' })
+  // A Codeup change binds its Thread for its messages only: the ticket ends with its own ready report, not the merge.
+  expect(seen.bound).toEqual([{ key: 'yunxiao:mr:repo-1:7', own: true, ends: false }])
+  expect(seen.followed).toEqual([])
+  expect(seen.patched).toEqual([{ key: 'yunxiao:mr:repo-1:7', number: 7, isPr: true, url: merge.detailUrl, prAuthor: 'user-1' }])
+  expect(seen.reports.at(-1)).toMatchObject({ state: 'progress', summary: 'Opened the merge request.' })
+  // The target release is computed on demand: the previous release until it merges back, and the repository as Codeup names it.
+  expect(await run('orchestrator_codeup_target', { repository: 'group/app' })).toEqual({ repository: 'repo-1', target: 'release/20261101',
+    basis: 'previous', previous: 'release/20261101', mergedBack: false, base: 'master', ahead: 2 })
+  expect(await run('orchestrator_codeup_target', {})).toMatchObject({ repository: 'repo-1', target: 'release/20261101' })
+  await expect(run('orchestrator_codeup_target', { repository: 'group/other' })).rejects.toThrow('is not a repository of the Codeup workspace')
+  expect(calls.filter(call => call[1] === 'codeup-get-compare')).toHaveLength(2)
+})
+
+it('gives Yunxiao work items QA integration instead of MR tools and refuses completion without verified QA evidence', async () => {
+  const { ticket, trigger } = await h.acceptedTicket(feishu('qa-1', '@bot 修复 QA 主流程'))
+  const source = h.runtime.context({ kind: 'github', health: ['github'] })
+  const host = { engine: h.runtime.engine, store: h.runtime.store, sessions: h.runtime.sessions, resources: {},
+    source: { ...source, deployment: testDeployment({ github: undefined, codeup: testCodeup() }),
+      triggers: { ...source.triggers, get: () => ({ ...trigger, source: 'yunxiao', meta: { workitemId: 'wi-1', serial: 'SIQB-1' } }) } },
+    merges: { request: vi.fn(), requestPipeline: vi.fn(), requestSql: vi.fn() }, sendReplies: async () => {} } as unknown as ExecutorToolsHost
+  const tools = executorTools(host, ticket)
+  const names = tools.map(tool => tool.name)
+  expect(names).toContain('orchestrator_qa_integrate')
+  expect(tools.find(tool => tool.name === 'orchestrator_qa_integrate')!.schema.safeParse({ repository: 'repo-1', pipeline_id: '11' }).success).toBe(false)
+  for (const name of ['orchestrator_request_merge', 'orchestrator_codeup_target', 'orchestrator_request_pipeline', 'orchestrator_sql_approval']) expect(names).not.toContain(name)
+  const report = tools.find(tool => tool.name === 'orchestrator_report')!
+  await expect(report.execute({ state: 'ready', summary: 'green build', result: { verification: 'unit tests passed' } }, new AbortController().signal)).rejects.toThrow()
+  await expect(report.execute({ state: 'progress', summary: 'MR', changes: [{ repository: 'repo-1', localId: 1 }] }, new AbortController().signal)).rejects.toThrow('result.qa')
+  expect(h.runtime.store.tickets.get(ticket.id)?.ended).toBeUndefined()
+})
+
+it.each(['无需修改', '待确认', '待验证', '阻塞'])('accepts a ready %s conclusion without pretending that it passed QA', async status => {
+  const { ticket, trigger } = await h.acceptedTicket(feishu('qa-conclusion', '@bot 核实问题'))
+  const source = h.runtime.context({ kind: 'github', health: ['github'] })
+  const host = { engine: h.runtime.engine, store: h.runtime.store, sessions: h.runtime.sessions, resources: {},
+    source: { ...source, deployment: testDeployment({ github: undefined, codeup: testCodeup() }),
+      triggers: { ...source.triggers, get: () => ({ ...trigger, source: 'yunxiao', meta: { workitemId: 'wi-1', serial: 'SIQB-1' } }) } },
+    sendReplies: async () => {} } as unknown as ExecutorToolsHost
+  const report = executorTools(host, ticket).find(tool => tool.name === 'orchestrator_report')!
+  await report.execute({ state: 'ready', summary: '排查结论已记录', result: { status, verification: '已核对需求及现状', qa: { verified: true } } }, new AbortController().signal)
+  const stored = h.runtime.store.tickets.get(ticket.id)!
+  expect(stored.ended?.outcome).toBe('completed')
+  expect(stored.assignments.at(-1)?.report?.result).toEqual({ status, verification: '已核对需求及现状' })
+})
+
+it('forwards a caller-selected QA command timeout and rejects invalid timeout values', async () => {
+  const { ticket, trigger } = await h.acceptedTicket(feishu('qa-timeout', '@bot 验证长流程'))
+  const source = h.runtime.context({ kind: 'github', health: ['github'] })
+  const runQaCommand = vi.fn(async () => 'QA passed')
+  const host = { engine: h.runtime.engine, store: h.runtime.store, sessions: h.runtime.sessions, resources: {}, runQaCommand,
+    source: { ...source, deployment: testDeployment({ github: undefined, codeup: testCodeup() }),
+      triggers: { ...source.triggers, get: () => ({ ...trigger, source: 'yunxiao', meta: { workitemId: 'wi-1', serial: 'SIQB-1' } }) } },
+    sendReplies: async () => {} } as unknown as ExecutorToolsHost
+  vi.spyOn(qaTools, 'testQa').mockImplementation(async (_host, _id, _repository, command, run) => ({
+    environment: 'https://qa.example.test', command, output: await run(command, '/work/app', { DSH_QA_ENVIRONMENT: 'https://qa.example.test' }), projects: [], at: '',
+  }))
+  const tool = executorTools(host, ticket).find(tool => tool.name === 'orchestrator_qa_test')!
+  const args = { repository: 'app', command: 'run-long-integration', timeout_ms: 1_800_000 }, signal = new AbortController().signal
+  expect(tool.schema.safeParse(args).success).toBe(true)
+  for (const timeout_ms of [0, 999, 86_400_001]) expect(tool.schema.safeParse({ ...args, timeout_ms }).success).toBe(false)
+  await tool.execute(args, signal)
+  expect(runQaCommand).toHaveBeenCalledWith(ticket, args.command, '/work/app', signal, { DSH_QA_ENVIRONMENT: 'https://qa.example.test' }, args.timeout_ms)
+})
+
+it('keeps a multi-repository work item open until every run passes, then stores host-verified aggregate evidence', async () => {
+  const { ticket, trigger } = await h.acceptedTicket(feishu('qa-multi', '@bot 修复前后端联调'))
+  const source = h.runtime.context({ kind: 'github', health: ['github'] })
+  const repos = [{ id: 'repo-1', path: 'org-1/app', name: 'app' }, { id: 'repo-2', path: 'org-1/service', name: 'service' }]
+  const deployment = testDeployment({ github: undefined, codeup: testCodeup({ repositories: repos }) })
+  const commands = new Commands(() => deployment, {}, new AbortController().signal)
+  vi.spyOn(commands, 'withSignal').mockReturnValue(commands)
+  let failing = true
+  vi.spyOn(commands, 'aliyun').mockImplementation((async (first: unknown, second?: string[]) => {
+    const args = (second ?? first) as string[]
+    const index = args[1] === 'codeup-get-branch' ? Number(args[args.indexOf('--repository-id') + 1]!.slice(-1)) : Number(args[args.indexOf('--pipeline-id') + 1])
+    const commit = String(index).repeat(40)
+    if (args[1] === 'codeup-get-branch') return { commit: { id: commit } }
+    if (args[1] !== 'flow-get-pipeline-run') throw new Error('unexpected QA call')
+    return { pipelineId: index, pipelineRunId: index, status: index === 2 && failing ? 'FAIL' : 'SUCCESS', sources: [{ data: { repo: `https://codeup.aliyun.com/${repos[index - 1]!.path}.git`, branch: 'qa', isBranchMode: false, commit: JSON.stringify([{commitId: commit}]) } }], stages: [{ stageInfo: { jobs: [{
+      result: JSON.stringify({ data: { REPO_URL: `https://codeup.aliyun.com/${repos[index - 1]!.path}.git`,
+        COMMIT_INFO: `existing:${commit}:INTEGRATED;SIQB-1:${commit}:INTEGRATED;` } }),
+    }] } }] }
+  }) as never)
+  h.runtime.store.set(KV.yunxiao.qaScope(ticket.id), { branch: 'SIQB-1', repositories: repos.map(repo => repo.id) })
+  vi.spyOn(commands, 'git').mockImplementation(async (args, cwd) => {
+    const commit = cwd.endsWith('/service') ? '2'.repeat(40) : '1'.repeat(40)
+    if (args[0] === 'fetch' || args[0] === 'merge-base' || args[0] === 'status') return ''
+    if (args[0] === 'branch') return 'SIQB-1'
+    if (args[1] === '--show-toplevel') return cwd
+    return args.slice(1).map(() => commit).join('\n')
+  })
+  h.runtime.store.set(KV.yunxiao.qaPlan(ticket.id), { environment: 'http://qa.example.test', tested: true, projects: repos.map((repo, i) => ({
+    repository: repo.id, pipelineId: String(i + 1), qaBranch: 'qa', command: 'unit', directory: '/work/' + repo.name, commit: String(i + 1).repeat(40), output: 'unit passed',
+  })) })
+  h.runtime.store.set(KV.yunxiao.qaTest(ticket.id), { environment: 'http://qa.example.test', command: 'qa', output: 'QA HTTP passed', at: '',
+    projects: repos.map((repo, i) => ({ repository: repo.id, pipelineId: String(i + 1), runId: String(i + 1), commit: String(i + 1).repeat(40), qaBranch: 'qa', qaCommit: String(i + 1).repeat(40) })) })
+  const evidence = repos.map((repo, i) => {
+    const id = String(i + 1)
+    h.runtime.store.set(KV.yunxiao.qa(ticket.id, repo.id), { repository: repo.id, pipelineId: id, runId: id, branch: 'SIQB-1', commit: id.repeat(40), qaBranch: 'qa', qaCommit: id.repeat(40) })
+    return { repository: repo.id, pipeline_id: id, run_id: id, main_flow_passed: true, evidence: 'real component QA passed' }
+  })
+  const host = { engine: h.runtime.engine, store: h.runtime.store, sessions: h.runtime.sessions, resources: {},
+    source: { ...source, deployment, commands, triggers: { ...source.triggers, get: () => ({ ...trigger, source: 'yunxiao', meta: { workitemId: 'wi-multi', serial: 'SIQB-1' } }) } },
+    sendReplies: async () => {} } as unknown as ExecutorToolsHost
+  const report = executorTools(host, ticket).find(tool => tool.name === 'orchestrator_report')!
+  const args = { state: 'ready', summary: '前后端 QA 通过', result: { status: '已修复', verification: '联合登录场景实测通过',
+    qa: { repositories: evidence, main_flow_passed: true, evidence: 'joint QA passed with both current commits' } } }
+  await expect(report.execute(args, new AbortController().signal)).rejects.toThrow('not completed successfully')
+  expect(h.runtime.store.tickets.get(ticket.id)?.ended).toBeUndefined()
+  failing = false
+  await report.execute(args, new AbortController().signal)
+  const ended = h.runtime.store.tickets.get(ticket.id)!
+  expect(ended.ended?.outcome).toBe('completed')
+  expect(ended.assignments.at(-1)?.report?.result?.qa).toMatchObject({ verified: true, repositories: [
+    { repository: 'repo-1', commit: '1'.repeat(40) }, { repository: 'repo-2', commit: '2'.repeat(40) },
+  ] })
 })
 
 it('tells the main Session of the settings, prompts, requeues and unsubscriptions others made, never of its own', async () => {

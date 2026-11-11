@@ -12,7 +12,7 @@ import { jobRegistry } from './fixtures/host.ts'
 import { evalsHealth } from '../src/app/views/overview.ts'
 import { mandateInstructions } from '../src/executor/dsh.ts'
 import { masterPrompt } from '../src/app/context.ts'
-import { reference, testMachine } from './fixtures/deployment.ts'
+import { reference, testCodeup, testMachine } from './fixtures/deployment.ts'
 import type { Machine } from '../src/deployment.ts'
 import { SCHEMA_VERSION, Store } from '../src/app/store.ts'
 import { TextCache } from '../src/app/cache.ts'
@@ -28,12 +28,15 @@ import { feishuChannel } from '../src/sources/feishu-trigger.ts'
 import { commentTrigger, githubChannel } from '../src/sources/github-trigger.ts'
 import { IM_WORDS } from '../src/infra/text.ts'
 import { observePull, pullOf } from '../src/sources/github-pull.ts'
-import { credentialHelper, workerGitConfig } from '../src/infra/environment.ts'
+import { credentialHelper, workerGitConfig, workerHooks } from '../src/infra/environment.ts'
 import { policyHistory } from '../src/app/settings-history.ts'
 import { overview } from '../src/app/views/overview.ts'
 import { preview, readable } from '../src/app/views/text.ts'
 import { decisionList, search, threadDetail, threadList } from '../src/app/views/threads.ts'
 import { executorLoad, ticketDetail, ticketList } from '../src/app/views/tickets.ts'
+import * as yunxiao from '../src/sources/yunxiao.ts'
+import { YunxiaoFileSchema } from '../src/sources/yunxiao-config.ts'
+import { workitemOf, workitemTrigger } from '../src/sources/yunxiao-trigger.ts'
 
 let runtime: Runtime
 const viewsOf = (value: Runtime) => ({ store: value.store, sources: value.sources, links: value.links() })
@@ -150,6 +153,7 @@ beforeEach(async () => {
     [`${BOT()} config strict-mode`]: 'strict-mode: bot (source: profile)',
     [`${BOT()} api GET /open-apis/bot/v3/info --as bot --format ndjson`]: '{"bot":{"open_id":"ou_bot"},"code":0,"msg":"ok"}',
     [HELPERS]: `file:${workerGitConfig(directory)}\0${credentialHelper(AGENT())}\0`,
+    ['git config --global --get core.hooksPath']: `${workerHooks(directory)}\n`,
     [SCOPED]: `global\0credential.helper\n\0global\0credential.https://github.com.helper\n${credentialHelper(AGENT())}\0`,
   }
   const ctx = new Context()
@@ -292,6 +296,183 @@ it('assesses a proactive observation in the orchestrator Session and creates the
   expect(await runTool(`worker-${ticket.id}`, 'orchestrator_read', { resource: `ticket/${ticket.id}/assignment` })).toMatchObject({ text: expect.stringContaining('Proactively accepted under copy') })
 })
 
+describe('asking the approver about an unsettled triage candidate', () => {
+  const direction = { implementation_requested: true, target_basis: 'specified', requires_design_decision: false, evidence: 'requested copy change' }
+  const candidate = () => {
+    const trigger = feishu('triage1', 'TEST-1 修改按钮文案', { mentions: [] })
+    return { ...trigger, meta: { ...trigger.meta, triage: true, workitemId: 'wi-1', cycle: 0 } }
+  }
+  beforeEach(() => {
+    runtime.store.set(KV.merge.approver, { openId: MEMBER, chatId: CHAT, at: '' })
+    vi.mocked(Commands.prototype.lark).mockResolvedValue({ message_id: 'om_triage' })
+  })
+  it.each([
+    ['observe would_accept', { code: 'observed' }, { direction, would_accept: true }],
+    ['already started', { code: 'startedTicket' }, undefined],
+    ['no assessment audit', { code: 'ignoredFromCard' }, undefined],
+    ['malformed direction', { code: 'directionUnsettled' }, { direction: {} }],
+    ['no implementation request', { code: 'directionUnsettled' }, { direction: { ...direction, implementation_requested: false, requires_design_decision: true } }],
+  ])('does not ask for %s', async (_name, reason, audit) => {
+    const ask = vi.spyOn(runtime.merges, 'askTriage')
+    const trigger = candidate()
+    await receive(trigger)
+    runtime.engine.decide(trigger.id, { kind: 'ignore', reason, ...audit ? { audit } : {} })
+    await runtime.idle()
+    expect(ask).not.toHaveBeenCalled()
+  })
+  it.each([
+    { ...direction, requires_design_decision: true },
+    { ...direction, target_basis: 'undetermined' },
+  ])('asks about an unsettled direction and redelivers the approver request: %j', async unsettled => {
+    const trigger = candidate()
+    await receive(trigger)
+    runtime.engine.decide(trigger.id, { kind: 'ignore', reason: { code: 'directionUnsettled' }, audit: { direction: unsettled } })
+    await vi.waitFor(() => expect(runtime.store.get(KV.merge.message('om_triage'))).toMatchObject({ kind: 'triage', triggerId: trigger.id }))
+    const reply = feishu('triage2', '开工', { chat_type: 'p2p', mentions: [] })
+    await receive({ ...reply, meta: { ...reply.meta, approval: true, parentId: 'om_triage' } })
+    const approved = runtime.store.triggers.get(`${trigger.id}:approved`)!
+    expect(approved).toMatchObject({ addressed: 'direct', text: expect.stringContaining('【审批人已确认开工】'), meta: { triage: false, approved: true, approvedBy: MEMBER } })
+    await runtime.passes.pump()
+    await runtime.idle()
+    expect(relays(runtime.masterId).some(item => item.trigger_id === approved.id)).toBe(true)
+    const result = await route({ kind: 'accept', trigger_id: approved.id, title: '修改按钮文案', worktree_name: 'triage-copy', acknowledgement: '收到，修改按钮文案。' })
+    expect(result).toHaveProperty('ticket.ticket_id')
+  })
+  it('persists a failed question send and retries it after restart without another decision', async () => {
+    const trigger = candidate()
+    await receive(trigger)
+    vi.mocked(Commands.prototype.lark).mockRejectedValueOnce(new Error('temporary Feishu failure'))
+    runtime.engine.decide(trigger.id, { kind: 'ignore', reason: { code: 'directionUnsettled' },
+      audit: { direction: { ...direction, requires_design_decision: true } } })
+    await runtime.effects.idle('triage')
+    expect(runtime.effects.pending('triage', trigger.id)).toBe(true)
+    expect(runtime.store.get(KV.merge.message('om_triage'))).toBeUndefined()
+    await restart()
+    await runtime.ready
+    runtime.store.db.prepare("UPDATE effect SET due=0 WHERE kind='triage'").run()
+    await runtime.effects.idle('triage')
+    expect(runtime.effects.pending('triage', trigger.id)).toBe(false)
+    expect(runtime.store.get(KV.merge.message('om_triage'))).toMatchObject({ kind: 'triage', triggerId: trigger.id })
+  })
+  it('keeps the question queued until an approver is configured', async () => {
+    runtime.store.delete(KV.merge.approver)
+    const trigger = candidate()
+    await receive(trigger)
+    runtime.engine.decide(trigger.id, { kind: 'ignore', reason: { code: 'directionUnsettled' },
+      audit: { direction: { ...direction, requires_design_decision: true } } })
+    await runtime.effects.idle('triage')
+    expect(runtime.effects.pending('triage', trigger.id)).toBe(true)
+    expect(runtime.store.get(KV.merge.message('om_triage'))).toBeUndefined()
+    runtime.store.set(KV.merge.approver, { openId: MEMBER, chatId: CHAT, at: '' })
+    runtime.store.db.prepare("UPDATE effect SET due=0 WHERE kind='triage'").run()
+    await runtime.effects.idle('triage')
+    expect(runtime.effects.pending('triage', trigger.id)).toBe(false)
+    expect(runtime.store.get(KV.merge.message('om_triage'))).toMatchObject({ triggerId: trigger.id })
+  })
+  it('queues no question when the decision transaction rolls back', async () => {
+    const trigger = candidate(); await receive(trigger)
+    const ask = vi.spyOn(runtime.merges, 'askTriage')
+    expect(() => runtime.store.atomic(() => {
+      runtime.engine.decide(trigger.id, { kind: 'ignore', reason: { code: 'directionUnsettled' },
+        audit: { direction: { ...direction, requires_design_decision: true } } })
+      throw new Error('rollback decision')
+    })).toThrow('rollback decision')
+    await runtime.effects.idle('triage')
+    expect(runtime.effects.pending('triage', trigger.id)).toBe(false)
+    expect(ask).not.toHaveBeenCalled()
+  })
+})
+
+describe('fresh Yunxiao validation before a triage approval starts work', () => {
+  const native = () => ({ id: 'wi-1', serialNumber: 'TEST-1', subject: 'Current request', description: 'fresh details',
+    category: 'Bug', status: '28', assignedTo: 'agent-1', spaceIdentifier: 'proj-1', gmtModified: '2026-11-03T00:00:00Z' })
+  const rules = () => YunxiaoFileSchema.parse({ organization: 'org-1', workspace: '/tmp/workspace', projects: [
+    { id: 'proj-1', intake: 'triage', types: [{ category: 'Bug', receive: ['28'], started: '100010', verified: '29' }] },
+  ] })
+  const prepare = () => {
+    const file = rules()
+    vi.spyOn(yunxiao, 'currentRules').mockImplementation(() => ({ file }))
+    Object.assign(runtime.setup.deployment, { codeup: testCodeup({ organization: 'org-1', account: { id: 'agent-1', name: 'Agent', commitEmail: 'agent@example.test' } }) })
+    const settings = runtime.store.settings()
+    runtime.store.saveSettings({ ...settings, sources: { ...settings.sources, yunxiao: { enabled: true, config: {} } } })
+    const origin = workitemTrigger(workitemOf(native()), 'agent-1', 0, 'agent-1', { triage: true })
+    runtime.store.triggers.save(origin)
+    runtime.store.set(KV.yunxiao.workitem('wi-1'), { cycle: 0, status: '28', assignee: 'agent-1', commentAt: '' })
+    runtime.store.set(KV.merge.approver, { openId: MEMBER, chatId: CHAT, at: '' })
+    runtime.store.set(KV.merge.message('om_native_triage'), { kind: 'triage', thread: '', ticketId: '', at: '', workitemId: 'wi-1', triggerId: origin.id })
+    const sent = vi.spyOn(runtime.outbox, 'send')
+    const aliyun = vi.spyOn(Commands.prototype, 'aliyun').mockResolvedValue(native() as never)
+    const received = vi.spyOn(runtime.engine, 'receive').mockReturnValue('stored')
+    const reply = feishu('native-approve', '开工', { chat_type: 'p2p', mentions: [] })
+    return { file, origin, sent, aliyun, received, reply: { ...reply, meta: { ...reply.meta, approval: true, parentId: 'om_native_triage' } } }
+  }
+  it('retains a cold-start question until enabled Yunxiao rules have loaded', async () => {
+    const h = prepare()
+    runtime.store.delete(KV.merge.message('om_native_triage'))
+    vi.mocked(yunxiao.currentRules).mockReturnValue(undefined)
+    vi.mocked(Commands.prototype.lark).mockResolvedValue({ message_id: 'om_cold_triage' })
+    runtime.effects.enqueue('triage', h.origin.id, { triggerId: h.origin.id, reason: 'Needs confirmation' })
+    await runtime.effects.idle('triage')
+    expect(runtime.effects.pending('triage', h.origin.id)).toBe(true)
+    expect(h.aliyun).not.toHaveBeenCalled()
+    expect(runtime.store.get(KV.merge.message('om_cold_triage'))).toBeUndefined()
+    vi.mocked(yunxiao.currentRules).mockReturnValue({ file: h.file })
+    runtime.store.db.prepare("UPDATE effect SET due=0 WHERE kind='triage'").run()
+    await runtime.effects.idle('triage')
+    expect(runtime.effects.pending('triage', h.origin.id)).toBe(false)
+    expect(runtime.store.get(KV.merge.message('om_cold_triage'))).toMatchObject({ triggerId: h.origin.id })
+  })
+  it.each(['assignee', 'status', 'category', 'project', 'cycle', 'source disabled'])('consumes stale approval without dispatch after %s changed', async field => {
+    const h = prepare(), item = native()
+    if (field === 'assignee') item.assignedTo = 'someone-else'
+    if (field === 'status') item.status = '29'
+    if (field === 'category') item.category = 'Task'
+    if (field === 'project') item.spaceIdentifier = 'another-project'
+    if (field === 'cycle') runtime.store.set(KV.yunxiao.workitem('wi-1'), { cycle: 1, status: '28', assignee: 'agent-1', commentAt: '' })
+    if (field === 'source disabled') {
+      const settings = runtime.store.settings()
+      runtime.store.saveSettings({ ...settings, sources: { ...settings.sources, yunxiao: { enabled: false, config: {} } } })
+    }
+    h.aliyun.mockResolvedValue(item as never)
+    await runtime.merges.onTrigger(h.reply)
+    expect(h.received).not.toHaveBeenCalled()
+    expect(runtime.store.tickets.list()).toHaveLength(0)
+    expect(runtime.store.get(KV.merge.message('om_native_triage'))).not.toHaveProperty('triggerId')
+    expect(h.sent.mock.calls.at(-1)![0].text).toContain('确认已过期，未开工')
+    expect(h.aliyun.mock.calls.every(([first, second]) => (Array.isArray(first) ? first : second)?.[1] !== 'projex-update-workitem')).toBe(true)
+  })
+  it('dispatches current work-item material only after native state and repair cycle still match', async () => {
+    const h = prepare()
+    await runtime.merges.onTrigger(h.reply)
+    expect(h.received).toHaveBeenCalledExactlyOnceWith(expect.objectContaining({ id: `${h.origin.id}:approved`,
+      text: expect.stringContaining('fresh details'), meta: expect.objectContaining({ approved: true, cycle: 0, category: 'Bug', projectId: 'proj-1' }) }))
+    expect(h.sent.mock.calls.at(-1)![0].text).toBe('已开始处理这条工作项。')
+  })
+  it('retains the confirmation when native validation is unavailable and permits a later retry', async () => {
+    const h = prepare(); h.aliyun.mockRejectedValueOnce(new CliError('temporary native failure', 503))
+    await runtime.merges.onTrigger(h.reply)
+    expect(h.received).not.toHaveBeenCalled()
+    expect(runtime.store.get(KV.merge.message('om_native_triage'))).toMatchObject({ triggerId: h.origin.id })
+    expect(h.sent.mock.calls.at(-1)![0].text).toContain('未开工')
+    await runtime.merges.onTrigger(h.reply)
+    expect(h.received).toHaveBeenCalledTimes(1)
+    expect(runtime.store.get(KV.merge.message('om_native_triage'))).not.toHaveProperty('triggerId')
+  })
+})
+
+it('does not execute an old MR confirmation after a Yunxiao work item switches to QA integration', async () => {
+  const { trigger, ticket } = await acceptedTicket()
+  runtime.store.triggers.save({ ...trigger, source: 'yunxiao', meta: { workitemId: 'wi-1', serial: 'SIQB-1' } })
+  runtime.store.set(KV.merge.message('om_legacy_merge'), { kind: 'merge', thread: 'yunxiao:mr:repo-1:1', ticketId: ticket.id, at: '' })
+  const onTrigger = vi.spyOn(runtime.merges, 'onTrigger')
+  const reply = feishu('qa-old-confirmation', '同意', { chat_type: 'p2p', mentions: [] })
+  await receive({ ...reply, meta: { ...reply.meta, approval: true, parentId: 'om_legacy_merge' } })
+  await runtime.passes.pump()
+  await runtime.idle()
+  expect(onTrigger).not.toHaveBeenCalled()
+  expect(runtime.store.replyStatus(key('qa-obsolete-merge', reply.id))).toBe('sent')
+})
+
 it('accepts silently under a rule that says so, gives the worker the rule procedure, and closes it as dropped when nothing is left for a human', async () => {
   const policy = runtime.store.settings().policy
   await runtime.settings.save('policy', { ...policy, rules: [...policy.rules, { id: 'silent-bugfix', name: '沉默地复现和修复', enabled: true, instruction: 'Reproduce minimally first; accept silently.' }] }, runtime.store.blockRevision('policy'), 'panel')
@@ -327,7 +508,7 @@ it('records worker reports, binds the task PR, ends the ticket on ready without 
   expect(relays(runtime.masterId).at(-1)).toMatchObject({ kind: 'worker_attention', ticket: { ticket_id: ticket.id, attention: { question: 'Desktop too?' } } })
   await expect(runTool(runtime.masterId, 'orchestrator_reply', { ticket_id: ticket.id, purpose: 'attention', human_action: 'other', text: 'x' })).rejects.toThrow('current attention question')
   expect(await runTool(runtime.masterId, 'orchestrator_reply', { ticket_id: ticket.id, purpose: 'attention', human_action: 'Desktop too?', text: '要不要也改桌面端？' })).toEqual({ status: 'sent' })
-  await runTool(sessionId, 'orchestrator_report', { state: 'progress', summary: 'pr open', pr_number: 42, human_action: null })
+  await runTool(sessionId, 'orchestrator_report', { state: 'progress', summary: 'pr open', changes: [{ repository: 'acme/widgets', localId: 42 }], human_action: null })
   const bound = runtime.store.tickets.get(ticket.id)!
   expect(pullOf(bound)).toBe(42)
   expect(bound.attention).toBeUndefined()
@@ -338,7 +519,7 @@ it('records worker reports, binds the task PR, ends the ticket on ready without 
   expect(await runTool(runtime.masterId, 'orchestrator_reply', { ticket_id: ticket.id, purpose: 'result', text: '已提交 PR #42，待 review。' })).toEqual({ status: 'sent' })
   const mergedAt = new Date().toISOString()
   const merged = { number: 42, state: 'closed', merged: true, merged_at: mergedAt, html_url: 'https://github.com/acme/widgets/pull/42',
-    user: { login: 'agent-bot' }, head: { sha: 'abc', ref: 'agent/x', repo: { full_name: 'acme/widgets' } } }
+    user: { login: 'agent-bot' }, head: { sha: 'abc', ref: 'agent/x', repo: { full_name: 'acme/widgets' } }, base: { ref: 'master' } }
   await observePull(runtime.context(githubKind), merged)
   const ended = runtime.store.tickets.get(ticket.id)!
   expect(ended).toMatchObject({ ended: expect.objectContaining({ by: 'executor', outcome: 'merged' }) })
@@ -352,7 +533,7 @@ it('records worker reports, binds the task PR, ends the ticket on ready without 
 
 it('lists each ticket with the Threads it subscribes to, as their Sources describe them', async () => {
   const { sessionId, ticket } = await acceptedTicket()
-  await runTool(sessionId, 'orchestrator_report', { state: 'progress', summary: 'pr open', pr_number: 42 })
+  await runTool(sessionId, 'orchestrator_report', { state: 'progress', summary: 'pr open', changes: [{ repository: 'acme/widgets', localId: 42 }] })
   const line = () => ticketList(viewsOf(runtime), 'working', 0, 20).items.find(item => item.id === ticket.id)!
   runtime.store.threads.describe('github:42', { label: '#42 Fix the margin', facts: { number: { value: '#42' }, ci: { label: 'CI', value: { zh: '通过', en: 'passed' } } } })
   expect(line()).not.toHaveProperty('prNumber')
@@ -972,12 +1153,12 @@ it('runs setup again while the Feishu bot check failed, and restores the process
 
 it('writes worker shims and the agent environment from the configuration only, and restores the environment on stop', async () => {
   const bin = join(directory, 'worker-bin')
-  expect(readdirSync(bin).sort()).toEqual(['gh', 'lark-cli'])
+  expect(readdirSync(bin).sort()).toEqual(['aliyun', 'gh', 'lark-cli', 'security'])
   expect(readFileSync(join(bin, 'lark-cli'), 'utf8')).toContain(`exec '${BOT()}'`)
   runtime.store.saveSettings({ ...runtime.store.settings(), executor: { ...runtime.store.settings().executor, blockedCommands: ['personal-gh'] } })
   const next = await restart({}, { feishu: null })
   await next.ready
-  expect(readdirSync(bin).sort()).toEqual(['gh', 'lark-cli', 'personal-gh'])
+  expect(readdirSync(bin).sort()).toEqual(['aliyun', 'gh', 'lark-cli', 'personal-gh', 'security'])
   expect(readFileSync(join(bin, 'personal-gh'), 'utf8')).toContain('personal-gh is blocked in this installation; use gh, which acts as agent-bot.')
   expect(readFileSync(join(bin, 'lark-cli'), 'utf8')).toContain('lark-cli is unavailable: this installation has no Feishu bot.')
   expect(readFileSync(join(bin, 'gh'), 'utf8')).toContain(`exec '${AGENT()}'`)
@@ -1004,9 +1185,9 @@ it('rewrites the blocked-command shims when the Executor settings change them, w
   const bin = join(directory, 'worker-bin')
   const save = (blockedCommands: string[]) => runtime.settings.save('executor', { ...runtime.store.settings().executor, blockedCommands }, runtime.store.blockRevision('executor'), 'panel')
   expect(await save(['personal-gh'])).toMatchObject({ saved: true, restarting: false })
-  expect(readdirSync(bin).sort()).toEqual(['gh', 'lark-cli', 'personal-gh'])
+  expect(readdirSync(bin).sort()).toEqual(['aliyun', 'gh', 'lark-cli', 'personal-gh', 'security'])
   await save([])
-  expect(readdirSync(bin).sort()).toEqual(['gh', 'lark-cli'])
+  expect(readdirSync(bin).sort()).toEqual(['aliyun', 'gh', 'lark-cli', 'security'])
   // The commands workers need cannot be blocked.
   await expect(save(['gh'])).rejects.toThrow()
   expect(restarts).not.toHaveBeenCalled()
@@ -1131,8 +1312,12 @@ it('runs a GitHub-only deployment: the GitHub part of the Policy decides alone, 
 })
 
 
-it('credits each human reviewer once in the default delivery requirements on every commit of the PR, never with an empty commit', async () => {
+it('limits reviewer-credit history rewriting to GitHub and keeps Codeup credit on new substantive commits', async () => {
   const delivery = runtime.prompts.current().config.delivery
+  expect(delivery).toContain('The rewriting procedure below is GitHub-only.')
+  expect(delivery).toContain('Codeup: no history rewriting or force-push for credit.')
+  expect(delivery).toContain('Credit new substantive commits and retest/publish; otherwise use orchestrator_report.')
+  expect(delivery).toContain('No empty credit commits.')
   expect(delivery).toContain('Co-authored-by: <name or login> <id+login@users.noreply.github.com>')
   expect(delivery).toContain('on every commit of the PR branch')
   expect(delivery).toContain('git filter-branch -f --msg-filter')
@@ -1329,12 +1514,12 @@ it('records a report, the PR it binds and its relay together, or none of them', 
   deliveries.mockClear()
   const before = runtime.store.tickets.get(ticket.id)!
   // A report the Engine refuses binds no PR, though the PR itself could be bound.
-  await expect(runTool(sessionId, 'orchestrator_report', { state: 'ready', summary: 'done', pr_number: 42, human_action: 'Ship it?' })).rejects.toThrow()
+  await expect(runTool(sessionId, 'orchestrator_report', { state: 'ready', summary: 'done', changes: [{ repository: 'acme/widgets', localId: 42 }], human_action: 'Ship it?' })).rejects.toThrow()
   // A PR the pull request rules refuse records no report.
   vi.mocked(Commands.prototype.gh).mockImplementation(async args => args[1]?.includes('/pulls/')
     ? { state: 'open', user: { login: 'someone' }, html_url: 'https://github.com/acme/widgets/pull/7', head: { ref: 'feature/other', sha: 'h', repo: { full_name: 'acme/widgets' } } }
     : { default_branch: 'master', permissions: { push: true } })
-  await expect(runTool(sessionId, 'orchestrator_report', { state: 'progress', summary: 'pr open', pr_number: 7, human_action: 'Desktop too?' })).rejects.toThrow()
+  await expect(runTool(sessionId, 'orchestrator_report', { state: 'progress', summary: 'pr open', changes: [{ repository: 'acme/widgets', localId: 7 }], human_action: 'Desktop too?' })).rejects.toThrow()
   const after = runtime.store.tickets.get(ticket.id)!
   expect(after).not.toHaveProperty('follows')
   expect(after).not.toHaveProperty('attention')
@@ -1419,7 +1604,7 @@ it('releases the database and the state directory lock when it fails to start, s
 
 it('tells the conversation that the PR merged when work a restart recovered ends with it later', async () => {
   const { ticket, sessionId } = await acceptedTicket()
-  await runTool(sessionId, 'orchestrator_report', { state: 'progress', summary: 'pr open', pr_number: 42 })
+  await runTool(sessionId, 'orchestrator_report', { state: 'progress', summary: 'pr open', changes: [{ repository: 'acme/widgets', localId: 42 }] })
   // The host restarted with the worker mid-work: its Assignment starts again with a recovery note.
   const before = runtime.store.tickets.get(ticket.id)!
   runtime.engine.assignmentInterrupted(ticket.id, runningAssignment(before)!.id)
@@ -1427,7 +1612,7 @@ it('tells the conversation that the PR merged when work a restart recovered ends
   expect(runtime.store.tickets.get(ticket.id)!.assignments).toHaveLength(2)
   // The PR merged before the restart; the recovered work goes on, and nothing is said yet.
   const merged = { number: 42, state: 'closed', merged: true, merged_at: before.assignments[0]!.createdAt, html_url: 'https://github.com/acme/widgets/pull/42',
-    user: { login: 'agent-bot' }, head: { sha: 'abc', ref: 'agent/x', repo: { full_name: 'acme/widgets' } } }
+    user: { login: 'agent-bot' }, head: { sha: 'abc', ref: 'agent/x', repo: { full_name: 'acme/widgets' } }, base: { ref: 'master' } }
   await observePull(runtime.context(githubKind), merged)
   expect(runtime.store.tickets.get(ticket.id)).not.toHaveProperty('ended')
   const id = key('pr-terminal', '42', 'feishu', JSON.stringify({ chatId: CHAT, messageId: 'om_1' }), 'merged')

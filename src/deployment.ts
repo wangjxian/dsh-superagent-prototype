@@ -1,12 +1,15 @@
-/** Plugin configuration and startup verification for repository access and agent CLI identities. */
+/** Plugin configuration and startup verification for code hosting access and agent CLI identities. */
 import { LIMITS } from './limits.ts'
-import { accessSync, constants, statSync } from 'node:fs'
+import { accessSync, constants, readdirSync, statSync } from 'node:fs'
 import { delimiter, isAbsolute, join } from 'node:path'
 import type { Volatile } from '@deepseek-ai/cordis'
 import s from '@deepseek-ai/schemastery'
 import { z } from 'zod'
 import type { SubprocessRuntime } from '@deepseek-ai/dsh-subprocess'
+import { githubHosting, type HostAccount, type Hosting } from './hosting.ts'
 import { runAsWorker, sameDirectory, withoutDirectory, workerBin } from './infra/environment.ts'
+import { TOKEN_MISSING, YUNXIAO, tokenArgv } from './infra/yunxiao.ts'
+import { codeupHosting } from './sources/codeup-hosting.ts'
 import { SetupError } from './setup.ts'
 
 const reason = (error: unknown): string => error instanceof Error ? error.message : String(error)
@@ -46,16 +49,46 @@ export const GithubAccountsSchema = z.object({
   repository: z.string().trim().regex(/^([A-Za-z0-9_.-]+\/[A-Za-z0-9_.-]+)?$/, 'owner/name').default(''),
   cli: z.string().trim().default(''),
 })
+/** The Codeup account's configuration: the aliyun CLI, the organization, and the workspace whose repositories a ticket may deliver to. */
+export const CodeupAccountsSchema = z.object({
+  cli: z.string().trim().default(''),
+  organization: z.string().trim().default(''),
+  workspace: z.string().trim().default(''),
+  commitEmail: z.string().trim().default(''),
+})
 export const FeishuBotSchema = z.object({ cli: z.string().trim().default('') })
 /** Source configuration keys that affect deployment setup and trigger a restart when changed. */
-export const SETUP_FIELDS: Readonly<Record<string, readonly string[]>> = { github: Object.keys(GithubAccountsSchema.shape), feishu: Object.keys(FeishuBotSchema.shape) }
+export const SETUP_FIELDS: Readonly<Record<string, readonly string[]>> = {
+  github: Object.keys(GithubAccountsSchema.shape), codeup: Object.keys(CodeupAccountsSchema.shape), feishu: Object.keys(FeishuBotSchema.shape),
+}
 
+export interface GithubAccount { cli: string; login: string; noreply: string }
+/**
+ * One repository of the Codeup workspace a ticket may deliver to: its id, its group path, its local directory name, and the
+ * default branch releases are cut from, when Codeup reports one.
+ */
+export interface CodeupRepository { id: string; path: string; name: string; defaultBranch?: string }
+/** The resolved Codeup account: the CLI that reaches the organization, and the workspace repositories it may push to. */
+export interface CodeupAccount {
+  cli: string
+  organization: string
+  workspace: string
+  account: HostAccount
+  repositories: readonly CodeupRepository[]
+}
+/** What startup resolved: the code hosting platform in use, the accounts it found, and the optional Feishu bot. */
 export interface Deployment extends Machine {
+  /** The platform a ticket's changes are delivered to, and the account they are made as. */
+  hosting: Hosting
+  /** The GitHub repository this installation watches; empty unless GitHub is configured. */
   repository: string
-  github: { cli: string; login: string; noreply: string }
+  github?: GithubAccount
+  codeup?: CodeupAccount
   feishu?: FeishuBot
 }
 export interface FeishuBot { cli: string; appId: string; brand: 'feishu' | 'lark'; botId: string; name: string }
+/** The account dsh-superagent acts as on GitHub, whose commits carry the account's noreply address. */
+export const githubAccount = (github: GithubAccount): HostAccount => ({ id: github.login, name: github.login, commitEmail: github.noreply })
 
 /** Resolve a command name or absolute path to an executable file, ignoring the worker shim directory. */
 export function executable(name: string, path: string, exclude?: string): string {
@@ -79,15 +112,19 @@ const GithubUser = z.object({ login: z.string().regex(/^[A-Za-z0-9-]+$/), id: z.
 const RepositoryAccess = z.object({ name: z.string().regex(/^[A-Za-z0-9_.-]+\/[A-Za-z0-9_.-]+$/), push: z.boolean().nullable() })
 function parsed<T>(schema: z.ZodType<T>, text: string): T | undefined {
   let value: unknown
-  try { value = JSON.parse(text) } catch { return undefined /* Non-JSON output; the caller surfaces the setup failure. */ }
+  try { value = JSON.parse(text.slice(Math.max(0, text.indexOf('{')))) } catch { return undefined /* Non-JSON output; the caller surfaces the setup failure. */ }
   const result = schema.safeParse(value)
   return result.success ? result.data : undefined
 }
-/** Verify the agent's GitHub CLI identity and push access to the configured repository. */
-export async function resolveDeployment(machine: Machine, github: unknown, probe: Probe, path = process.env.PATH ?? ''): Promise<Deployment> {
+/**
+ * Verifies the agent's GitHub CLI identity and push access to the configured repository.
+ * @returns the repository and account, or undefined when the GitHub Source names neither, which leaves code hosting to another platform.
+ */
+export async function resolveGithub(machine: Machine, github: unknown, probe: Probe, path = process.env.PATH ?? ''): Promise<{ repository: string; github: GithubAccount } | undefined> {
   const { stateDir } = machine
   const accounts = GithubAccountsSchema.parse(github ?? {})
   const remote = accounts.repository
+  if (!remote && !accounts.cli) return undefined
   if (!remote) throw new SetupError('repositoryUnset')
   if (!accounts.cli) throw new SetupError('agentCliUnset')
   let cli: string
@@ -102,7 +139,112 @@ export async function resolveDeployment(machine: Machine, github: unknown, probe
   if (!access) throw new SetupError('repositoryUnreported', { repository: remote })
   const repository = access.name
   if (access.push !== true) throw new SetupError('repositoryReadOnly', { account: agent.login, repository })
-  return { ...machine, repository, github: { cli, login: agent.login, noreply: `${agent.id}+${agent.login}@users.noreply.github.com` } }
+  return { repository, github: { cli, login: agent.login, noreply: `${agent.id}+${agent.login}@users.noreply.github.com` } }
+}
+
+/**
+ * Verifies the agent's GitHub CLI identity and push access to the configured repository.
+ * @throws SetupError when the GitHub Source is not configured or its account cannot push.
+ */
+export async function resolveDeployment(machine: Machine, github: unknown, probe: Probe, path = process.env.PATH ?? ''): Promise<Deployment> {
+  const resolved = await resolveGithub(machine, github, probe, path)
+  if (!resolved) throw new SetupError('repositoryUnset')
+  return { ...machine, ...resolved, hosting: githubHosting({ repository: resolved.repository, account: githubAccount(resolved.github) }) }
+}
+
+const YunxiaoUser = z.looseObject({
+  id: z.union([z.string(), z.number()]).transform(String),
+  username: z.string().nullish(), name: z.string().nullish(), nickName: z.string().nullish(), email: z.string().nullish(),
+})
+const WorkspaceRepository = z.looseObject({
+  id: z.union([z.string(), z.number()]).transform(String),
+  name: z.string().nullish(), path: z.string().nullish(), pathWithNamespace: z.string().nullish(), defaultBranch: z.string().nullish(),
+  // Codeup reports a member's role as `accessLevel` (30 developer, 40 master); `allowPush` is a push-rule flag, not the role.
+  accessLevel: z.union([z.string(), z.number()]).nullish(),
+  canPush: z.boolean().nullish(), permission: z.string().nullish(),
+  permissions: z.looseObject({ push: z.boolean().nullish() }).nullish(),
+})
+/** The group path of a Codeup remote (`git@codeup.aliyun.com:<group>/<name>.git`), or undefined for another host. */
+export const codeupPath = (remote: string): string | undefined => {
+  const match = /^(?:(?:https?|ssh):\/\/)?(?:git@)?codeup\.aliyun\.com[:/](.+)$/i.exec(remote.trim())
+  return match?.[1]?.replace(/\/+$/, '').replace(/\.git$/, '')
+}
+/** Whether the repository API reports push access, by whichever field it fills; undefined when it reports none. */
+const canPush = (repository: z.infer<typeof WorkspaceRepository>): boolean | undefined =>
+  (repository.accessLevel != null && repository.accessLevel !== '' ? Number(repository.accessLevel) >= 30 : undefined)
+    ?? repository.canPush ?? repository.permissions?.push ?? (repository.permission ? /write|admin|owner/i.test(repository.permission) : undefined)
+/** What a failed probe printed, preferring the command's own standard error over the wrapper's message about it. */
+const detail = (error: unknown): string => {
+  const stderr = error && typeof error === 'object' && 'stderr' in error && typeof error.stderr === 'string' ? error.stderr : undefined
+  return (stderr ?? reason(error)).trim()
+}
+/** Maps a failed yunxiao call to the setup problem that names it, telling a locked keychain from a signed-out CLI. */
+const codeupFailure = (error: unknown, code: 'codeupCliSignedOut' | 'codeupRepositoryUnreadable', values: Record<string, string>): SetupError =>
+  new SetupError(detail(error).includes(TOKEN_MISSING) ? 'codeupTokenMissing' : code, { ...values, output: detail(error) })
+/** Scans the workspace's immediate children for Codeup checkouts and keeps the ones the account may push to. */
+async function workspaceRepositories(workspace: string, organization: string, cli: string, probe: Probe): Promise<CodeupRepository[]> {
+  const repositories: CodeupRepository[] = []
+  const refused: string[] = []
+  for (const entry of readdirSync(workspace, { withFileTypes: true })) {
+    if (!entry.isDirectory() || entry.name.startsWith('.')) continue
+    const directory = join(workspace, entry.name)
+    const remote = await probe(['git', '-C', directory, 'remote', 'get-url', 'origin']).catch(() => '')
+    const path = codeupPath(remote)
+    if (!path) continue
+    const text = await probe(tokenArgv(cli, YUNXIAO.repository(organization, path)))
+      .catch((error: unknown) => { throw codeupFailure(error, 'codeupRepositoryUnreadable', { repository: path }) })
+    const access = parsed(WorkspaceRepository, text)
+    if (!access) throw new SetupError('codeupRepositoryUnreadable', { repository: path, output: text.slice(0, 500) })
+    if (canPush(access) !== true) { refused.push(path); continue }
+    repositories.push({ id: access.id, path: access.pathWithNamespace ?? path, name: entry.name,
+      ...access.defaultBranch ? { defaultBranch: access.defaultBranch } : {} })
+  }
+  if (!repositories.length) throw new SetupError('codeupNoRepositories', { workspace, refused: refused.join(', ') })
+  return repositories
+}
+/**
+ * Verifies the Codeup account, the keychain token, the SSH key, and the workspace repositories a ticket may deliver to.
+ * @returns the account, or undefined when the Codeup Source names none of its fields, which leaves code hosting to another platform.
+ */
+export async function resolveCodeup(machine: Machine, codeup: unknown, probe: Probe, path = process.env.PATH ?? ''): Promise<CodeupAccount | undefined> {
+  const config = CodeupAccountsSchema.parse(codeup ?? {})
+  if (!config.cli && !config.organization && !config.workspace) return undefined
+  if (!config.cli) throw new SetupError('codeupCliUnset')
+  if (!config.organization) throw new SetupError('codeupOrgUnset')
+  if (!config.workspace) throw new SetupError('codeupWorkspaceUnset')
+  let cli: string
+  try { cli = executable(config.cli, path, workerBin(machine.stateDir)) } catch (error) { throw new SetupError('codeupCliMissing', { output: reason(error) }) }
+  let workspace = ''
+  try { workspace = statSync(config.workspace).isDirectory() ? config.workspace : '' } catch { /* Reported below. */ }
+  if (!workspace) throw new SetupError('codeupWorkspaceMissing', { workspace: config.workspace })
+  const text = await probe(tokenArgv(cli, YUNXIAO.user())).catch((error: unknown) => { throw codeupFailure(error, 'codeupCliSignedOut', {}) })
+  const user = parsed(YunxiaoUser, text)
+  if (!user) throw new SetupError('codeupAccountUnreported', { output: text.slice(0, 500) })
+  // Codeup authenticates git over SSH, so startup proves the operator's key reaches the organization before a worker relies on it.
+  const ssh = await probe(['ssh', '-o', 'BatchMode=yes', '-o', 'ConnectTimeout=10', '-o', 'StrictHostKeyChecking=accept-new', '-T', 'git@codeup.aliyun.com'])
+    .catch((error: unknown) => reason(error))
+  if (!/welcome to codeup/i.test(ssh)) throw new SetupError('codeupSshUnavailable', { output: ssh.slice(0, 500) })
+  const name = user.username ?? user.name ?? user.nickName ?? user.id
+  return { cli, organization: config.organization, workspace,
+    account: { id: user.id, name, commitEmail: config.commitEmail || user.email || `${user.id}@codeup.aliyun.com` },
+    repositories: await workspaceRepositories(workspace, config.organization, cli, probe) }
+}
+/**
+ * Resolves the code hosting platform from the GitHub and Codeup Source accounts: GitHub hosts when it is configured, otherwise
+ * Codeup, whose repositories the workspace holds.
+ * @throws SetupError (`hostingUnset`) when neither Source names an account.
+ */
+export async function resolveHosting(machine: Machine, accounts: { github: unknown; codeup: unknown }, probe: Probe,
+  path = process.env.PATH ?? ''): Promise<Deployment> {
+  const github = await resolveGithub(machine, accounts.github, probe, path)
+  const codeup = await resolveCodeup(machine, accounts.codeup, probe, path)
+  if (!github && !codeup) throw new SetupError('hostingUnset')
+  if (github) {
+    const hosting = githubHosting({ repository: github.repository, account: githubAccount(github.github) })
+    return { ...machine, ...github, hosting, ...(codeup ? { codeup } : {}) }
+  }
+  const resolved = codeup!
+  return { ...machine, repository: '', codeup: resolved, hosting: codeupHosting(resolved) }
 }
 
 const AuthStatus = z.object({ appId: z.string().regex(/^cli_[A-Za-z0-9]+$/), brand: z.enum(['feishu', 'lark']).default('feishu'), identities: z.object({ bot: z.object({ status: z.string() }) }) })

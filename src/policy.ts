@@ -110,11 +110,12 @@ export type SettingsOrigin = 'panel' | 'tool' | 'sync'
 
 export const POLICY_REVISION = 'mandate-v3'
 /**
- * Compute a version hash for settings that affect work authorization.
+ * Compute a version hash for settings that affect work authorization, and for `digest`, what a Source keeps outside the settings
+ * and still decides work by (a receiving-rule file, for example).
  * Changes to models, concurrency, pause state, or polling intervals do not invalidate existing decisions.
  */
-export function policyVersion(settings: Settings): string {
-  return key(POLICY_REVISION, JSON.stringify({ rules: settings.policy.rules, mode: settings.eval.mode, sources: settings.policy.sources }))
+export function policyVersion(settings: Settings, digest = ''): string {
+  return key(POLICY_REVISION, JSON.stringify({ rules: settings.policy.rules, mode: settings.eval.mode, sources: settings.policy.sources, digest }))
 }
 export function allowedSender(settings: Settings, actor: ActorRef): z.infer<typeof AllowedSchema> | undefined {
   return settings.policy.sources[actor.source]?.allowed.find(entry => sameName(entry.id, actor.id))
@@ -165,7 +166,7 @@ export function policyEffects(tickets: readonly Ticket[], old: Settings, now: Se
 }
 /** Build the active Policy for gating incoming Triggers and revalidating existing Ticket Mandates. */
 export function settingsPolicy(settings: Settings, sources: SourceScope): Policy {
-  const version = policyVersion(settings)
+  const version = policyVersion(settings, sources.policyDigest?.() ?? '')
   const mode = settings.eval.mode
   /** Gate non-human triggers: only listed bots (as inferred candidates) and senderless system/CI events may pass; other bots are rejected. */
   const machineGate = (trigger: Trigger): GateResult => {
@@ -189,6 +190,8 @@ export function settingsPolicy(settings: Settings, sources: SourceScope): Policy
   return {
     version, paused: settings.paused, evalTimeoutMs: settings.eval.timeoutSeconds * 1000,
     gate(trigger: Trigger, thread, tickets) {
+      // An answer the host acts on itself, such as a merge confirmation, is no work: it is recorded but never becomes a Ticket.
+      if (trigger.meta.approval === true) return { admissible: false, reason: 'hostHandled' }
       if (!trigger.human) return machineGate(trigger)
       const allowed = allowedSender(settings, trigger.actor)
       const scope = listened(sources, trigger.source, trigger.meta)

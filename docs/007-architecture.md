@@ -249,8 +249,8 @@ Each model request binds the Session to the current prompt revision. The revisio
 | `src/app/tools/main.ts`, `src/app/tools/executor.ts` | Tool arguments of the main Session and the Executor Sessions into calls of the core classes, and their results into cards |
 | `src/app/http.ts`, `src/app/views/`, `src/app/api.ts` | HTTP requests into calls, and Store reads into the panel's views; `api.ts` types every route for the panel |
 | `src/app/resources.ts`, `src/app/links.ts`, `src/app/cards.ts` | Resource names into reads, source messages into links, records into compact cards for models |
-| `src/sources/github*.ts`, `src/sources/feishu*.ts`, `src/sources/poll.ts` | GitHub and Feishu payloads into Triggers and Thread facts, and messages into CLI calls |
-| `src/deployment.ts`, `src/setup.ts`, `src/infra/` | Setup probes and problems, CLI transport, the agent's process environment |
+| `src/sources/github*.ts`, `src/sources/feishu*.ts`, `src/sources/codeup*.ts`, `src/sources/poll.ts` | GitHub, Feishu and Codeup payloads into Triggers and Thread facts, pull requests and merge requests into the platform-neutral `Change`, and messages into CLI calls |
+| `src/hosting.ts`, `src/deployment.ts`, `src/setup.ts`, `src/infra/` | The hosting contract both platforms implement, setup probes and problems, CLI transport, the agent's process environment |
 
 ## Dependency rules
 
@@ -274,16 +274,15 @@ Each model request binds the Session to the current prompt revision. The revisio
 - **Fixed refusals.** A refusal a person or an agent can cause is a `UserError(code, values)` from `USER_ERRORS` in `src/core/errors.ts`. The management API answers a `missing` code with 404 and the others with 400, and the panel words each code in its language. Setup problems are `SetupError` codes (`src/setup.ts`) and fixed health texts `HealthCode`s (`src/sources/host.ts`), worded the same way.
 ### Source-specific dependencies
 
-Some generic modules still refer directly to GitHub or Feishu:
+Some generic modules still refer directly to a platform:
 
 - Outbox applies the Feishu chat word limit.
 - `src/app/links.ts` resolves Feishu message links and `repliedTo`. It and Runtime read settings with `feishuSettings`.
 - `src/app/resources.ts` reads the `feishu/` and `github/` originals; `src/app/cards.ts` uses `pullOf` for Ticket cards.
-- Runtime sends `pullEndNotices` for merged or closed Tickets.
-- Executor tools bind reported pull requests with `readPull` and `claimPull`, using the GitHub context exposed by Runtime.
-- MasterAssessor reads repository files with `readRepositoryPath`.
-- Sessions and Prompts register built-in skills only for GitHub and Feishu. Migration converts their schema-10 records.
-- Setup probes only GitHub and Feishu account fields (`SETUP_FIELDS`). Only those Sources receive account setup problems through `SourceContext.problem`.
+- `src/hosting.ts` holds the GitHub implementation beside the contract, and `src/sources/codeup-hosting.ts` the Codeup one, whose Threads belong to the `yunxiao` Source a later phase polls.
+- The glue names no platform where the contract suffices: MasterAssessor reads repository files through `hosting.readPath`, the Executor tools read and claim changes through `hosting.readChange` and `hosting.claim`, and Runtime posts a Ticket's end notices through `hosting.endNotices`.
+- Sessions and Prompts register the built-in skill of each configured platform: GitHub, Codeup and Feishu. Migration converts their schema-10 records.
+- Setup probes the account fields of GitHub, Codeup and Feishu (`SETUP_FIELDS`), and each of those Sources receives its account setup problems through `SourceContext.problem`.
 
 
 ## Modules
@@ -293,6 +292,7 @@ Some generic modules still refer directly to GitHub or Feishu:
 | `src/index.ts` | The main plugin entry: reads the machine settings, starts the Runtime, and gives it the restart that a save of a Source's account uses |
 | `src/deployment.ts` | The plugin `Config` and `Machine`; `resolveDeployment` and `resolveFeishuBot` read the repository and the accounts from the Source settings, each CLI run as Executor shells run it; `SETUP_FIELDS` lists the Source fields setup reads. The code names no person, account or organization |
 | `src/setup.ts` | Setup problems: `SetupError`, with a code, the place that fixes it and the English text the log, the main Session and the panel share |
+| `src/hosting.ts` | The code hosting contract the core and the Sources share: `Platform`, `HostAccount`, `Change`, `Claim`, `Hosting` and `ClaimInput`, `ticketBranch` and `triggerChange`, the end notices of a closed change, and the GitHub implementation `githubHosting` with `githubChange`. A second platform adds an implementation rather than a branch in the glue |
 | `src/policy.ts` | The Policy: the settings schemas by block, the Policy version, the gate and Mandate revalidation |
 | `src/admission.ts` | The admission table's values, each cell's options and defaults, shared with the panel |
 | `src/limits.ts` | The limits of the values a person sets, which the settings schemas check and the panel's fields offer |
@@ -353,6 +353,8 @@ Some generic modules still refer directly to GitHub or Feishu:
 | `src/app/views/overview.ts` | The overview: Tickets that need a person, problems, the last day's flow and the Executor's load |
 | `src/executor/dsh.ts` | The DshExecutor, `WorkerSlots`, `ticketExecution`, `inputMessage` and `mandateInstructions` |
 | `src/executor/background.ts` | A worker's background work in DeepSeek Harness, the shell jobs its Session owns (`ctx.jobs`) and its subagents (`ctx.subagents`): `runningJobs`, `untilQuiet`, `killJobs`, `collectJobs`, `stopSubagents`, `stopBackground`, `until`, and `cancelled`, the workers whose turn a stop of their subagents cancelled |
+| `src/infra/yunxiao.ts` | The yunxiao CLI vocabulary: `YUNXIAO`, the subcommands dsh-superagent calls with their kebab-case flags, `tokenScript` and `tokenArgv`, which read the keychain token inside one process, the read-only subcommand globs, `AGENT_COMMENT`, and `yunxiaoError`, which reads the `StatusCode` and `Data` of a failed call |
+| `src/infra/release.ts` | `targetRelease`: the release branch a merge request targets, from the repository's `release/<yyyymmdd>` branches and the day in Asia/Shanghai, whether the previous release has merged back into the base branch, and the day's release the host creates when it must |
 | `src/infra/commands.ts` | `Commands`, the CLI transport: `run`; `api` and `pages`, limited to the configured repository and validated; `lark` as the bot; `git`. `CliError` carries the code a command's output reports, such as a GitHub HTTP status, and a command that prints nothing fails with how it ended, never with its arguments; `validItems` skips and counts the malformed items of a list |
 | `src/infra/environment.ts` | The agent's process environment: command shims, the git configuration and credential helper, `runAsWorker`, and the checks of the environment and of a Ticket's directory |
 | `src/infra/paths.ts` | The package's root, where packaged files are |
@@ -367,6 +369,18 @@ Some generic modules still refer directly to GitHub or Feishu:
 | `src/sources/github-pull.ts` | The pull request rules: which pull requests a Ticket follows (`claimPull`, `observePull`), the closes it reports to the Engine, and `pullEndNotices`, the chat notice of a Ticket that ended merged or closed |
 | `src/sources/github-channel.ts` | The GitHub Channel: comments and review thread replies, `sent` or `gone` |
 | `src/sources/github-read.ts` | CI snapshots, repository reads, the `github/` resources, and `githubThreadContext`: an Issue's or pull request's conversation by page |
+| `src/sources/codeup.ts` | The Codeup account kind and plugin entry, exported as `./codeup-watch`: the aliyun CLI, the organization, the workspace and the commit email, the repositories of the workspace, the execution variables it registers, and its health entry. Phase one receives no work items and polls nothing |
+| `src/sources/codeup-hosting.ts` | The Codeup implementation of the hosting contract: `codeupHosting`, `repositoryOf`, `codeupUrl` and the `yunxiao:mr:<repository id>:<n>` Threads a merge request binds to |
+| `src/sources/yunxiao.ts` | The yunxiao work-item kind and plugin entry, exported as `./yunxiao-watch`: its settings, the Policy rows of its projects, the work-item variables, and a poll round that searches the configured projects, turns work items and their comments into Triggers, and writes finished Tickets back |
+| `src/sources/yunxiao-config.ts` | The receiving rules the yunxiao Source reads from a YAML file: its schema, `loadConfig`, the digest the Policy version carries, and the project and category lookups polling makes |
+| `src/sources/yunxiao-trigger.ts` | Work items and their comments as Triggers, the `yunxiao:wi:<id>` Thread and comment Channel of a work item, and the fields the CLI's reports carry |
+| `src/sources/yunxiao-read.ts` | A work item's material as context: its description, comments, parent and related requirements, the `yunxiao/` resources, and `yunxiaoThreadContext` |
+| `src/sources/yunxiao-text.ts` | `richText`: yunxiao's HTML, jsonML and plain text as Markdown, so a description reads the same in a prompt as in the work item |
+| `src/sources/yunxiao-channel.ts` | The yunxiao Channel: comments on a work item, marked as an agent's, `sent` or `gone`, and the work item's page link |
+| `src/sources/yunxiao-write.ts` | Write-back of a finished Ticket: the result comment in the team's five states, the status a verified fix moves to, and the refusal of a workflow that does not allow it |
+| `src/sources/yunxiao-mr.ts` | The merge requests a Ticket follows: a poll round of each one's state, conflict and head, its comments and its CI, the Triggers those changes become, and the `yunxiao:mr:<repository id>:<n>` Threads they belong to |
+| `src/app/qa.ts` | Local unit tests, project QA publication and deployed integration verification: preserve the existing branch-manager inputs, serialize starts, retain the actual run and commit, and verify successful QA evidence before completing a Yunxiao work item |
+| `src/app/merge.ts` | The host's merge approvals: the conditions a merge request must meet, the Feishu confirmation message with the target release it suggests, the reply parsed by code (`同意`, `改 <release>`, or a reason that rejects), the checks before merging, and the merge itself, which only the host runs |
 | `src/sources/feishu.ts` | The Feishu kind and plugin entry, exported as `./feishu-watch` |
 | `src/sources/feishu-trigger.ts` | Feishu messages as Triggers, by one rule for live events, history pages and topic pages |
 | `src/sources/feishu-loops.ts` | The Feishu loops: the event consumer, history recovery, chat names and polling of subscribed topics |
@@ -397,7 +411,7 @@ Some generic modules still refer directly to GitHub or Feishu:
 | `src/client/locales.ts` | All copy in both languages, and the glossary of [001 Domain model](001-domain.md) |
 | `src/client/client.css`, `css.d.ts` | The panel's stylesheet, loaded as text |
 
-`src/sources/github.ts` and `src/sources/feishu.ts` are also the entries of the two Source plugins, built by `tsdown.config.ts` and exported in `package.json` as `./github-watch` and `./feishu-watch`. The bundle's `cordis.patch.yml` inserts the three plugins, with Feishu disabled.
+`src/sources/github.ts`, `src/sources/codeup.ts`, `src/sources/yunxiao.ts` and `src/sources/feishu.ts` are also the entries of the four Source plugins, built by `tsdown.config.ts` and exported in `package.json` as `./github-watch`, `./codeup-watch`, `./yunxiao-watch` and `./feishu-watch`. The bundle's `cordis.patch.yml` inserts the five plugins, with Feishu disabled.
 
 ## Tests
 
@@ -408,12 +422,26 @@ Some generic modules still refer directly to GitHub or Feishu:
 | `tests/policy.spec.ts` | Source scope, the gate, the admission table, Mandate revalidation, the Policy version, settings migrations and assessment outcomes |
 | `tests/registry.spec.ts` | `SourceRegistry`: instances, validation, Policy parts, Channels and Thread context |
 | `tests/sources.spec.ts` | The Feishu and GitHub Sources on a `SourceContext`: translation, polls and read positions, the pull request rules, health |
-| `tests/commands.spec.ts` | CLI calls as the deployment's accounts, the Channels' answers, and repository-scoped GitHub calls |
+| `tests/hosting.spec.ts` | The hosting contract on both platforms: a pull request and a merge request normalized into `Change`, the ticket-branch rule, each platform's binding rule, the Thread a change binds to, and the end notices of a closed change |
+| `tests/codeup.spec.ts` | The Codeup account kind: its settings and fields, the facts setup resolved, the workspace and work-item variables, its health entry, and the bundle entry it ships as |
+| `tests/yunxiao.spec.ts` | The yunxiao work-item Source on a `SourceContext`: its scope and Policy rows, the work-item variables, the poll round's Triggers for a new assignment, a reopened work item and a comment, a receiving-rule file that fails validation, and the write-back of a finished Ticket |
+| `tests/yunxiao-config.spec.ts` | The receiving rules: schema and defaults, the digest, the project and category lookups, and the errors a bad file raises |
+| `tests/yunxiao-trigger.spec.ts` | Work items and comments as Triggers: stable IDs, the fields each carries, the agent's own comments skipped, and the reference a Trigger exposes |
+| `tests/yunxiao-read.spec.ts` | A work item's context and the `yunxiao/` resources: the requests made, the messages returned, pagination, and a read that fails instead of reading as empty |
+| `tests/yunxiao-text.spec.ts` | `richText`: every tag it converts, jsonML, entities and nesting |
+| `tests/yunxiao-channel.spec.ts` | The yunxiao Channel: the comment it writes with the agent's marker, a work item that is gone, and the page link |
+| `tests/yunxiao-write.spec.ts` | Write-back: the result comment in each state, the status a verified fix moves to, and a workflow that refuses the move |
+| `tests/yunxiao-mr.spec.ts` | Merge-request polling: the state, comment and CI Triggers, a close reported to the Engine, the agent's own comments skipped, the CI baseline, and one merge request's failure staying its own |
+| `tests/qa.spec.ts` | Fixed-QA integration: pure development and QA-only conflict branches, shared-QA ancestry, complete project scope, native MR/run reconciliation, trigger rejection and actual deployment testing |
+| `tests/reopen-worktree.spec.ts` | Real Git worktree reuse after completion and reopen: same occupied serial branch, execution directory, HEAD and unfinished edits; no repeated prepare |
+| `tests/merge.spec.ts` | Merge approvals: the confirmation message, the three kinds of reply, a check that fails so nothing merges, a merge that runs the host's command, the notes a rejection and a move to another release leave, and a request repeated |
+| `tests/feishu-dm.spec.ts` | Direct messages from the bot: the message it creates in a person's chat, its idempotency key, the approval marker a reply carries, and the link of a direct conversation |
+| `tests/commands.spec.ts` | CLI calls as the deployment's accounts, the Channels' answers, repository-scoped GitHub calls, and the yunxiao calls that read the keychain token for one process, retry only reads and report the CLI's own `StatusCode` |
 | `tests/feishu-read.spec.ts`, `tests/github-read.spec.ts` | Feishu and GitHub reads |
 | `tests/admission-context.spec.ts`, `tests/feishu-image.spec.ts` | The Thread window of assessments, and Feishu image reads |
 | `tests/assessment.spec.ts` | What the MasterAssessor keeps per Eval, and when it lets go |
 | `tests/background.spec.ts` | Waiting for a worker's shell jobs and subagents: an end that woke it, and a host that stops |
-| `tests/bundle-patch.spec.ts` | The bundle's patch, read as DeepSeek Harness reads it, and the agent preset of Executor Sessions it defines |
+| `tests/bundle-patch.spec.ts` | The bundle's patch, read as DeepSeek Harness reads it: the Source plugins it inserts, and the agent preset of Executor Sessions it defines |
 | `tests/effects.spec.ts` | The effect queue: coalescing, limits, retries with backoff, health and shutdown |
 | `tests/passes.spec.ts` | Passes: one at a time, the ones asked for during a pass run as one after it, and the runtime health a failed pass reports |
 | `tests/outbox.spec.ts` | The Outbox on a running Runtime: messages wait while processing is paused or their Source is not installed |
@@ -424,7 +452,8 @@ Some generic modules still refer directly to GitHub or Feishu:
 | `tests/delivery.spec.ts` | `AgentDelivery` |
 | `tests/retry-health.spec.ts`, `tests/role-models.spec.ts` | Model budget retries, and the models of the two roles |
 | `tests/runtime.spec.ts` | The whole application on a simulated DeepSeek Harness host, through tools and HTTP |
-| `tests/tools.spec.ts` | The Sessions' tools: what `orchestrator_read` reads for each role, and the shapes and checks of the other main Session tools |
+| `tests/tools.spec.ts` | The Sessions' tools: what `orchestrator_read` reads for each role, the shapes and checks of the other main Session tools, the changes a report binds to its Ticket on either platform, and the target release `orchestrator_codeup_target` answers |
+| `tests/release.spec.ts` | The target release: Asia/Shanghai's calendar day, the previous release while it has not merged back, the day's own release once it has, the one the host creates, and the one a person named |
 | `tests/runtime-concurrency.spec.ts` | Work that overlaps: Triggers during a pass, Tickets that change during deliveries and launches |
 | `tests/http.spec.ts` | The same-origin and loopback checks, the status of each kind of failure, the body limit, path parameters and queries |
 | `tests/settings.spec.ts` | Settings saves that race a model or account check, a Policy sync that a save outran, and the refusals of the pause, a sync and a block |
@@ -432,10 +461,10 @@ Some generic modules still refer directly to GitHub or Feishu:
 | `tests/timeline.spec.ts` | A Thread's pages and a Trigger's neighbours by time and then id, with every received Trigger's time in one form |
 | `tests/migration.spec.ts` | The schema 11 migration: every stored record in its current shape, and the refusal of older schemas |
 | `tests/store.spec.ts` | Repositories and their working sets, in SQLite as in memory, the kv area, with every key of `KV` spelled only in `src/kv.ts` and the migration, settings history and queries |
-| `tests/prompts.spec.ts` | Prompt validation, assembly and versions |
+| `tests/prompts.spec.ts` | Prompt validation, assembly and versions, and the built-in skill of each configured platform |
 | `tests/cards.spec.ts` | The rules the built-in text must state, file by file |
 | `tests/model-surface.spec.ts` | Everything models read: tools, prompts, skills and inputs, checked against the tool schemas, the execution environment and the glossary, within a size budget per role |
-| `tests/deployment.spec.ts`, `tests/environment.spec.ts`, `tests/index.spec.ts` | The plugin configuration and setup, the agent's process environment, the plugin entry |
+| `tests/deployment.spec.ts`, `tests/environment.spec.ts`, `tests/index.spec.ts` | The plugin configuration and setup, a Codeup account's resolution, the agent's process environment (its shims, the aliyun forwarding script, git hooks and the Codeup SSH rewrite), the plugin entry |
 | `tests/service-script.spec.ts` | `scripts/dsh-superagent` against fake `ps`, `tmux` and `dsh` |
 | `tests/client.spec.tsx`, `tests/navigation.spec.ts`, `tests/controls.spec.tsx` | The client plugin's registration and polling, Session navigation and route memory, the local controls, and the panel's imports, which have no cycle |
 | `tests/panel-overview.spec.tsx`, `panel-source.spec.tsx`, `panel-trigger.spec.tsx`, `panel-eval.spec.tsx`, `panel-execution.spec.tsx` | Each page of the panel, against a fake management API answered by route |
@@ -476,6 +505,8 @@ A generated column is computed from its row's JSON and is empty outside its set,
 | Session prompt history | `session-prompts:<session id>` |
 | Source state | Read positions such as `github-cursor:<number>`, PR CI fingerprints and seen Feishu-topic messages; keys begin with the kind or `thread-` plus a Thread key |
 | Display names | `source-labels:<source id>` |
+| Source digests | `source-digest:<source id>`, a digest of what a Source keeps outside the settings and still decides work by; the Policy version carries it, so an evaluation in flight is discarded when the file changes |
+| yunxiao work items | `yunxiao-cursor`, `yunxiao-config` (the receiving rules last read, with their digest), `yunxiao-workitem:<id>` (repair cycle, status, assignee, last comment read) and `yunxiao-writeback:<ticket id>` |
 
 Dismissal is stored on its Decision. Input text is rendered from the Ticket when read, so neither needs a separate key-value record.
 

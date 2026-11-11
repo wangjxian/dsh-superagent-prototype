@@ -222,7 +222,7 @@ export interface Assignment {
   startedAt?: string
   endedAt?: string
   endedReason?: string
-  report?: { state: ReportState; summary: string; at: string }
+  report?: { state: ReportState; summary: string; at: string; result?: Record<string, unknown> }
   /** When Inputs last reached the worker; one at or after `report.at` means the worker has been busy with Inputs since that report. */
   deliveredAt?: string
   /**
@@ -311,7 +311,16 @@ export interface Ticket {
  * closed. `followsDone` holds once no Thread of its own is open, or, when the ticket has no `own` Thread, once every followed
  * Thread closed; the ticket then ends unless its work has not finished (see `Tickets.unfinished`).
  */
-export interface Follow { thread: string; own: boolean; closed?: { at: string; outcome: 'merged' | 'closed' } }
+export interface Follow {
+  thread: string
+  own: boolean
+  /**
+   * Whether the Thread's close ends the ticket; absent means it does. A change request binds with `false`: its merge no longer
+   * ends the ticket, which ends with its own ready report instead, while the Thread still wakes it on a person's message.
+   */
+  ends?: boolean
+  closed?: { at: string; outcome: 'merged' | 'closed' }
+}
 export interface Execution { name: string; directory: string; assignment: string }
 
 /** Whether a ticket is open: it has not ended. */

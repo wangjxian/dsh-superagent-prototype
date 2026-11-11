@@ -3,6 +3,7 @@ import type { SessionId } from '@deepseek-ai/dsh-session'
 import { UserError, key, latestReport, reached, runningAssignment, threadKey, type Ticket, type Trigger } from '../core/index.ts'
 import { batchOf, inputMessage, triggerMessage, workerSessionId } from '../executor/dsh.ts'
 import { readGithub } from '../sources/github-read.ts'
+import { yunxiaoRead } from '../sources/yunxiao-read.ts'
 import { feishuReferences, feishuRead } from '../sources/feishu-read.ts'
 import { feishuRef } from '../sources/feishu.ts'
 import { feishuTriggerId } from '../sources/feishu-trigger.ts'
@@ -52,6 +53,7 @@ export const RESOURCES: readonly { name: string; holds: string; executor?: true 
   { name: 'models/<provider>', holds: 'one provider\'s models' },
   { name: 'feishu/<trigger-id>/…', holds: 'a Feishu original, as the dsh-superagent-feishu skill describes', executor: true },
   { name: 'github/…', holds: 'a GitHub original, as the dsh-superagent-github skill describes', executor: true },
+  { name: 'yunxiao/…', holds: 'a yunxiao work item with its parent and related requirements, and its comments, as the dsh-superagent-yunxiao skill describes', executor: true },
 ]
 export const resourceGrammar = (executor: boolean): string => RESOURCES.filter(resource => !executor || resource.executor)
   .map(resource => `${resource.name}: ${resource.holds}`).join('; ')
@@ -104,10 +106,12 @@ const trigger = (host: ResourceHost, id: string, ticketId?: string): Trigger => 
 async function sourcePage(read: Read, source: string, fetch: () => Promise<unknown>) {
   const { host, resource, offset, sessionId } = read
   const body = offset === 0 ? JSON.stringify(await fetch()) : host.pages.get(`${sessionId}:${resource}`)
-  if (body === undefined) throw new Error(`Read this ${source === 'feishu' ? 'Feishu' : 'GitHub'} resource from offset 0 first`)
+  if (body === undefined) throw new Error(`Read this ${SOURCE_TITLE[source] ?? source} resource from offset 0 first`)
   if (offset === 0) host.pages.set(`${sessionId}:${resource}`, body)
   return text(read, body)
 }
+/** Display names of the originals whose pages cache by offset. */
+const SOURCE_TITLE: Readonly<Record<string, string>> = { feishu: 'Feishu', github: 'GitHub', yunxiao: 'yunxiao' }
 const THREAD_DECISIONS = 5
 const triggerLine = (trigger: Trigger) => ({ trigger_id: trigger.id, actor: trigger.actor.id, human: trigger.human, at: trigger.at,
   preview: preview(trigger.text), chars: trigger.text.length, read: `trigger/${trigger.id}` })
@@ -207,6 +211,17 @@ const ROUTES: readonly Route[] = [
     return sourcePage(read, 'feishu', () => feishuRead(commands, ref, read.resource, read.host.feishuPageSize()))
   }],
   ['github/', read => sourcePage(read, 'github', () => readGithub(read.host.commands.withSignal(read.signal), read.resource))],
+  ['yunxiao/', read => {
+    // A worker reads only the work item of its own ticket; the main Session reads any, as it does for GitHub originals.
+    const asked = decodeURIComponent(/^yunxiao\/wi\/([^/]+)/.exec(read.resource)?.[1] ?? '')
+    if (read.ticketId) {
+      const ticket = read.host.store.tickets.get(read.ticketId)
+      const origin = ticket && read.host.store.triggers.get(ticket.origin.triggerId)
+      const own = typeof origin?.meta.workitemId === 'string' ? origin.meta.workitemId : ''
+      if (!own || own !== asked) throw new Error('A worker may read only its own ticket\'s work item')
+    }
+    return sourcePage(read, 'yunxiao', () => yunxiaoRead(read.host.commands.withSignal(read.signal), read.resource))
+  }],
   ['trigger/', async read => {
     const { host, rest, ticketId, offset, signal } = read
     if (!rest || rest.includes('/')) throw new Error('Unknown context resource')

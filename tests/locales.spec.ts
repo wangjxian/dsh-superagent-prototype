@@ -3,6 +3,7 @@ import type { EffectKind } from '../src/app/effects.ts'
 import { en, zh, type DshSuperagentKey } from '../src/client/locales.ts'
 import { reasonLabel, type T } from '../src/client/text.ts'
 import { REASONS, USER_ERRORS } from '../src/core/index.ts'
+import { SETUP_PROBLEMS } from '../src/setup.ts'
 
 const placeholders = (text: string) => [...text.matchAll(/\{(\w+)\}/g)].map(match => match[1]).sort()
 
@@ -27,7 +28,7 @@ it('words a reason by its code with its values, each of a batch, and words a per
 it('names every health entry of dsh-superagent itself, which the overview shows when it fails', () => {
   // Each entry by its writer: dsh-superagent, the model budget retries, every kind of the effect queue, Channel messages, the
   // Executor and the unavailable Evals of the last hour.
-  const entries = { runtime: 0, models: 0, reply: 0, worker: 0, assessment: 0, launch: 0, delivery: 0, relay: 0,
+  const entries = { runtime: 0, models: 0, reply: 0, worker: 0, assessment: 0, triage: 0, launch: 0, delivery: 0, relay: 0,
     notice: 0, evals: 0 } satisfies Record<EffectKind | 'runtime' | 'models' | 'reply' | 'worker' | 'evals', 0>
   expect(Object.keys(entries).filter(name => !(`health.${name}` in zh))).toEqual([])
 })
@@ -35,6 +36,13 @@ it('names every health entry of dsh-superagent itself, which the overview shows 
 it('words every refusal the host words by code, in both languages', () => {
   expect(Object.keys(USER_ERRORS).filter(code => !zh[`userError.${code}` as DshSuperagentKey]
     || !en[`userError.${code}` as DshSuperagentKey])).toEqual([])
+})
+
+it('words every setup problem of every place the panel links to, in both languages', () => {
+  expect(Object.keys(SETUP_PROBLEMS).filter(code => !zh[`setup.${code}` as DshSuperagentKey]
+    || !en[`setup.${code}` as DshSuperagentKey])).toEqual([])
+  // Each place a problem is fixed in has its own fix hint on the overview.
+  expect([...new Set(Object.values(SETUP_PROBLEMS).map(([place]) => place))].filter(place => !zh[`problemSetupFix.${place}` as DshSuperagentKey])).toEqual([])
 })
 
 it('has words for every reason code the core records', () => {

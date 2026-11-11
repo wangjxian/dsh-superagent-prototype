@@ -21,7 +21,11 @@ function load(name: string) {
   if (!match) throw new Error(`Invalid packaged skill: ${path}`)
   return { name: match[1]!, description: match[2]!, content: match[3]!, path }
 }
-export const bundledSkills = { feishu: load('feishu'), github: load('github') }
+export const bundledSkills = { feishu: load('feishu'), github: load('github'), codeup: load('codeup'), yunxiao: load('yunxiao') }
+/** The name of a packaged skill, which a Session registers under the skill prefix. */
+export type BundledSkillName = keyof typeof bundledSkills
+/** The packaged skill `name` loads, or undefined for a team skill; an object's prototype names no packaged skill. */
+export const bundledSkill = (name: string) => Object.hasOwn(bundledSkills, name) ? bundledSkills[name as BundledSkillName] : undefined
 /**
  * Loads a built-in prompt file (`prompts/<name>.md`). Source `.md` files are written one sentence per line for
  * readable diffs; `promptFile` joins lines within each paragraph with spaces while keeping blank-line paragraph breaks.

@@ -44,6 +44,18 @@ export function feishuTrigger(input: unknown, botId: string, botAppId: string): 
 }
 export const feishuParent = (trigger: Trigger): string | undefined =>
   trigger.source === SOURCE && typeof trigger.meta.parentId === 'string' ? feishuTriggerId(trigger.meta.parentId) : undefined
+/** The message ids a Trigger may answer: the message it replies to, and the root of the topic it sits in. */
+export const feishuRepliesTo = (trigger: Trigger): string[] =>
+  [trigger.meta.parentId, trigger.meta.rootId].filter((id): id is string => typeof id === 'string' && id !== '')
+/**
+ * Marks the Trigger of a message that answers a merge confirmation, so the Policy's gate leaves it to the host instead of
+ * assessing it as work. `isConfirmation` says whether a message id is one the host sent to confirm a merge, which only the
+ * caller's own records can tell; a message that answers anything else keeps its meta.
+ */
+export function markApproval(trigger: Trigger, isConfirmation: (messageId: string) => boolean): Trigger {
+  if (trigger.source !== SOURCE) return trigger
+  return feishuRepliesTo(trigger).some(isConfirmation) ? { ...trigger, meta: { ...trigger.meta, approval: true } } : trigger
+}
 export function feishuRef(trigger: Trigger): FeishuRef | undefined {
   const meta = trigger.meta as { chatId?: string; messageId?: string }
   if (trigger.source !== SOURCE || !meta.chatId || !meta.messageId) return undefined

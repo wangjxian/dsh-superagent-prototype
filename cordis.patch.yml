@@ -6,6 +6,13 @@
       name: dsh-superagent
     - id: dsh-superagent-github
       name: dsh-superagent/github-watch
+    # Optional Codeup Source: phase one only carries the yunxiao account and the workspace, so an empty configuration stays idle.
+    - id: dsh-superagent-codeup
+      name: dsh-superagent/codeup-watch
+    # Optional work-item Source: receives the yunxiao work items assigned to the agent. It reads its receiving rules from the
+    # YAML file its settings name, so without that file it waits paused instead of failing.
+    - id: dsh-superagent-yunxiao
+      name: dsh-superagent/yunxiao-watch
     # Optional Feishu Source; requires configuring a bot CLI after enabling.
     - id: dsh-superagent-feishu
       name: dsh-superagent/feishu-watch

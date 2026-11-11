@@ -129,11 +129,14 @@ export const batchLine = (trigger: Trigger) => ({ trigger_id: trigger.id, from: 
 /** Returns the other triggers in a ticket's origin batch (excluding the primary `origin.triggerId`), oldest first. */
 export const batchOf = (host: { store: Pick<Store, 'triggers'> }, ticket: Ticket): Trigger[] => ticket.origin.triggerIds
   .filter(id => id !== ticket.origin.triggerId).flatMap(id => host.store.triggers.get(id) ?? [])
+const REUSE_WORKSPACE = 'Reuse this ticket\'s existing worktrees and branches; inspect git worktree list before creating anything. '
+  + 'Do not repeat git worktree add -b for a branch already checked out in its expected ticket directory. Preserve dirty changes. '
+  + 'If the branch belongs to an unexpected worktree, stop and report its path; never force, remove, move or reset that worktree.'
 const RESUMED = 'This ticket ended earlier and the message that follows, on its thread, resumed it under the same mandate. If it asks for '
   + 'more within the original scope, inspect the worktree, git history and PR state and continue; if it asks for work beyond that scope or '
   + 'for another ticket, hand it back with orchestrator_trigger_handback and report dropped; if it needs nothing, such as thanks, '
-  + 'report dropped without a message. Report ready when the follow-up is done. Do not repeat completed work.'
-const RETRIED = 'A person retried this ticket. Continue the assignment from the current worktree, git history and PR state.'
+  + 'report dropped without a message. Report ready when the follow-up is done. Do not repeat completed work. ' + REUSE_WORKSPACE
+const RETRIED = 'A person retried this ticket. Continue the assignment from the current worktree, git history and PR state. ' + REUSE_WORKSPACE
 /** Formats a policy-change input for the worker; inputs recorded before `effect` existed fall back to a general notice. */
 function policyMessage(effect?: PolicyEffect): string {
   if (!effect) return 'Policy change: the access or admission rules changed. Check that the remaining work stays within the assignment.'

@@ -1,0 +1,31 @@
+sources:
+  test_agent:
+    type: codeup
+    name: test-agent-service sandbox
+    endpoint: https://codeup.aliyun.com/62cf7f0b487c500c27f70f94/test-agent-service.git
+    branch: release/qa
+    cloneDepth: 0
+    certificate:
+      type: serviceConnection
+      serviceConnection: ukcun8gmzmbayzkp
+defaultWorkspace: test_agent
+stages:
+  qa:
+    name: QA integration verification
+    jobs:
+      smoke:
+        name: Verify service QA candidate
+        timeoutMinutes: 5
+        runsOn:
+          group: public/cn-beijing
+          container: build-steps-public-registry.cn-beijing.cr.aliyuncs.com/build-steps/alinux3:latest
+        steps:
+          check:
+            name: Run unit tests for fixed QA commit
+            step: Command
+            with:
+              run: |
+                set -eu
+                python3 -m unittest discover -s tests/unit -v
+                git rev-parse HEAD
+                echo FIXED_QA_RELEASE_READY

@@ -7,7 +7,7 @@ import { FAILURES_BEFORE_ERROR, Later, type Effects } from './effects.ts'
 import type { Store } from './store.ts'
 
 export interface OutboxHost {
-  readonly store: Pick<Store, 'atomic' | 'receipts'>
+  readonly store: Pick<Store, 'atomic' | 'receipts' | 'get' | 'set'>
   readonly effects: Pick<Effects, 'enqueue' | 'cancel' | 'handle' | 'idle'>
   readonly sources: Pick<SourceRegistry, 'instance' | 'channelAllowed' | 'send'>
   readonly commands: Commands
@@ -45,7 +45,8 @@ export class Outbox implements OutboxPort {
     if (store.receipts.behind(id, FAILURES_BEFORE_ERROR)) throw new Later('An earlier message of this ticket to this conversation waits')
     if (!sources.channelAllowed(receipt.channel)) { store.receipts.settle(receipt, 'channelIgnored'); return }
     // A permanently unreachable target (such as a recalled message or deleted Issue) settles as `channelGone` so its receipt prevents retries.
-    const result = await sources.send(receipt, commands)
+    // The Channel may need to remember a message it started, so an answer to it can be traced back to its Ticket.
+    const result = await sources.send(receipt, commands, { get: key => store.get(key), set: (key, value) => { store.set(key, value) } })
     if (result === 'waiting') throw new Later('The Source is not installed')
     store.receipts.settle(receipt, result === 'gone' ? 'channelGone' : 'sent')
   }

@@ -51,8 +51,8 @@ export class Engine {
    * opened it: the ticket subscribes to it, and a ready report ends it only once `followsDone` holds (see `Tickets.followsDone`).
    * @throws UserError when the ticket is unknown or has ended.
    */
-  bindThread(ticketId: string, thread: ThreadRef, own: boolean): Ticket {
-    return this.repo.atomic(() => this.tickets.bind(ticketId, thread, own))
+  bindThread(ticketId: string, thread: ThreadRef, own: boolean, ends = true): Ticket {
+    return this.repo.atomic(() => this.tickets.bind(ticketId, thread, own, ends))
   }
   /**
    * A Source's fact that a Thread closed, such as its pull request's merge, at the time it happened. An open ticket that
@@ -258,7 +258,7 @@ export class Engine {
 }
 
 /** What Sources ask and tell the Engine. */
-export type EngineForSources = Pick<Engine, 'receive' | 'bindThread' | 'threadClosed'>
+export type EngineForSources = Pick<Engine, 'receive' | 'bindThread' | 'threadClosed' | 'stopTicket'>
 /** What the main Session asks of the Engine. */
 export type EngineForMainSession = Pick<Engine, 'candidate' | 'candidateDelivered' | 'decide' | 'attach' | 'reply' | 'requestStatus' | 'note'>
 /** What people ask of the Engine, through the panel or the main Session. */

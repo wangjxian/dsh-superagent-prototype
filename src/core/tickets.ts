@@ -55,17 +55,20 @@ export class Tickets extends EnginePart {
     this.emit('ticket.created', { ticketId: id, decisionId, strength: mandate.strength })
   }
   /**
-   * Subscribes an open ticket to `thread` and records it in `ticket.follows` (`own` when opened by the ticket).
+   * Subscribes an open ticket to `thread` and records it in `ticket.follows` (`own` when opened by the ticket, `ends` when its
+   * close ends the ticket, which it does unless the caller says otherwise).
    * @throws UserError when the ticket is unknown or has ended.
    */
-  bind(ticketId: string, thread: ThreadRef, own: boolean): Ticket {
+  bind(ticketId: string, thread: ThreadRef, own: boolean, ends = true): Ticket {
     if (!liveTicket(this.require(ticketId))) throw new UserError('ticketEnded')
     this.subscribe(ticketId, thread)
     const ticket = this.require(ticketId)
     const followed = threadKey(thread)
     const follow = ticket.follows?.find(item => item.thread === followed)
-    // Re-binding a thread reopens it if previously closed; `own` remains true once set.
-    if (follow) { follow.own ||= own; delete follow.closed } else ticket.follows = [...ticket.follows ?? [], { thread: followed, own }]
+    // Re-binding a thread reopens it if previously closed; `own` remains true once set, and a binding that does not end the
+    // ticket stays that way.
+    if (follow) { follow.own ||= own; follow.ends = follow.ends === false || !ends ? false : undefined; delete follow.closed }
+    else ticket.follows = [...ticket.follows ?? [], { thread: followed, own, ...ends ? {} : { ends: false } }]
     ticket.updatedAt = this.now()
     this.repo.tickets.save(ticket)
     return ticket
@@ -91,9 +94,10 @@ export class Tickets extends EnginePart {
   /**
    * How a ticket that follows Threads is done with them: once no Thread it opened (`own`) is still open, or, when it opened none,
    * once every one it follows closed. It ends as the latest close among those Threads did; undefined while it is not done.
+   * A Thread bound without `ends` (a change request) counts in none of this: its close neither ends the ticket nor delays that.
    */
   followsDone(ticket: Ticket): Follow['closed'] {
-    const follows = ticket.follows ?? []
+    const follows = (ticket.follows ?? []).filter(item => item.ends !== false)
     const own = follows.filter(item => item.own)
     const counted = own.length ? own : follows
     if (!counted.length || counted.some(item => !item.closed)) return undefined

@@ -17,8 +17,10 @@ export interface WorkerReport {
   askedBy?: string
   /** The person's question this report answers, which the worker thereby takes up; authorizes the main Session to send an answer reply. */
   answers?: string
+  /** The structured outcome a worker submits with its report (the root cause, the changes, the verification), kept for the result comment of a later phase. */
+  result?: Record<string, unknown>
 }
-const RECOVERY_NOTE = 'The host restarted during this ticket. Inspect the current worktree, git history and GitHub state before continuing. Do not repeat an already completed external operation. Finish the original assignment and report its status.'
+const RECOVERY_NOTE = 'The host restarted during this ticket. Inspect the current worktree, git history and the hosting platform state before continuing. Do not repeat an already completed external operation. Finish the original assignment and report its status.'
 
 /**
  * Assignments records what the Executor and its workers report about the Assignments that run tickets: one started, Inputs
@@ -119,14 +121,17 @@ export class Assignments extends EnginePart {
     else delete ticket.attention
     // A replaced or cleared attention question withdraws any pending unsent reply for the previous question from the outbox.
     if (previous && previous.id !== attention?.id) this.replies.withdrawAttention(previous.id)
-    assignment.report = { state: report.state, summary: report.summary, at }
+    assignment.report = { state: report.state, summary: report.summary, at, ...report.result ? { result: report.result } : {} }
     ticket.updatedAt = at
     if (report.answers && !ticket.answers?.includes(report.answers)) ticket.answers = [...ticket.answers ?? [], report.answers]
     if (report.answers) this.takeUp(ticketId, report.answers)
     if (report.state === 'blocked' || report.state === 'failed') ticket.undelivered = ticket.undelivered.filter(id => !automatic(ticket.inputs.find(input => input.id === id)))
     this.repo.tickets.save(ticket)
     // A ticket that follows Threads ends with them: a ready report ends it only once followsDone holds, with that outcome.
-    const ready = !ticket.follows?.length ? 'completed' : this.tickets.followsDone(ticket)?.outcome
+    // A ticket whose Threads all bind without ending (a change request) ends as completed with its ready report; one that
+    // follows ending Threads ends as they did, once all of them closed.
+    const ending = (ticket.follows ?? []).filter(follow => follow.ends !== false)
+    const ready = !ending.length ? 'completed' : this.tickets.followsDone(ticket)?.outcome
     // A dropped report after a close the ticket deferred ends it as the close did, which its final notice tells.
     const outcome = report.state === 'dropped' ? this.tickets.followsDone(ticket)?.outcome ?? 'dropped' : report.state === 'ready' ? ready : undefined
     if (outcome) this.tickets.end(ticketId, 'executor', outcome, at)

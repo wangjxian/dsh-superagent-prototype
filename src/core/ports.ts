@@ -11,6 +11,11 @@ export type ScopeResult = { listened: true; observed: boolean; row?: string } | 
 /** Source configuration as the domain sees it: listening scope per trigger or per recorded Mandate basis. */
 export interface SourceScope {
   scope(input: { source: string; meta: Record<string, unknown> }): ScopeResult
+  /**
+   * A digest of what Sources keep outside the settings and still decide work by, such as a receiving-rule file a Source rereads
+   * on each poll. A Policy version that includes it discards in-flight evaluations when that file changes.
+   */
+  policyDigest?(): string
 }
 
 /** Versioned rules; `gate` decides who may originate work. Source scope is not part of Policy. */

@@ -4,7 +4,8 @@ import { tmpdir } from 'node:os'
 import { join } from 'node:path'
 import { promisify } from 'node:util'
 import { afterEach, beforeEach, describe, expect, it, vi } from 'vitest'
-import { Config, executable, machineOf, resolveDeployment, resolveFeishuBot, type Machine, type Probe } from '../src/deployment.ts'
+import { Config, codeupPath, executable, machineOf, resolveCodeup, resolveDeployment, resolveFeishuBot, resolveHosting, type Machine, type Probe } from '../src/deployment.ts'
+import { SECURITY } from '../src/infra/yunxiao.ts'
 import { gitEnv } from './fixtures/git.ts'
 
 const exec = promisify(execFile)
@@ -97,5 +98,82 @@ describe('setup', () => {
     await refuses('feishuNoBot')
     program(join(dir, 'bin', 'lark-cli'), 'echo "not configured" >&2; exit 1')
     await refuses('feishuCliFailed', { output: expect.stringContaining('not configured') })
+  })
+})
+
+describe('codeup setup', () => {
+  /** A workspace with `app` checked out from Codeup and `other` from GitHub, which a ticket may not deliver to. */
+  const workspace = (): string => {
+    const root = join(dir, 'workspace')
+    mkdirSync(join(root, 'app'), { recursive: true }); mkdirSync(join(root, 'other'), { recursive: true }); mkdirSync(join(root, '.cache'), { recursive: true })
+    return root
+  }
+  const checkout = async (name: string, remote: string): Promise<void> => {
+    await exec('git', ['init', '-q', join(workspace(), name)], { env: gitEnv() })
+    await exec('git', ['-C', join(workspace(), name), 'remote', 'add', 'origin', remote], { env: gitEnv() })
+  }
+  /** The fake aliyun CLI: the account, the repository, and whatever the test makes either answer. */
+  const aliyun = (answers: { user?: string; repository?: string } = {}): string =>
+    program(join(dir, 'bin', 'aliyun'), `case "$*" in\n  "devops base-get-user-by-token") ${answers.user ?? `echo '{"id":"62cf7f1d29d72730d9acc32d","username":"yedou","email":"yedou@example.com"}'`} ;;\n  "devops codeup-get-repository --organization-id org-1 --repository-id group%2Fapp") ${answers.repository ?? `echo '{"id":"451f7a12","pathWithNamespace":"group/app","accessLevel":"30","defaultBranch":"master"}'`} ;;\n  *) exit 1 ;;\nesac`)
+  const ssh = (welcome = true): string => program(join(dir, 'bin', 'ssh'),
+    welcome ? 'echo "Welcome to Codeup, yedou!" >&2; exit 1' : 'echo "Permission denied (publickey)." >&2; exit 255')
+  // The token script calls the keychain tool by absolute path, so the probe points it at a stand-in instead.
+  const codeupProbe: Probe = async argv => (await exec(argv[0]!, argv.slice(1).map(arg => arg.replaceAll(SECURITY, join(dir, 'bin', 'security'))),
+    { env: { PATH: path, HOME: dir } })).stdout
+  // Built per test: the directories come from the `beforeEach` that runs before each one.
+  const account = () => ({ cli: join(dir, 'bin', 'aliyun'), organization: 'org-1', workspace: join(dir, 'workspace'),
+    account: { id: '62cf7f1d29d72730d9acc32d', name: 'yedou', commitEmail: 'yedou@example.com' }, repositories: [{ id: '451f7a12', path: 'group/app', name: 'app', defaultBranch: 'master' }] })
+  const codeup = (overrides: Record<string, unknown> = {}) => ({ cli: 'aliyun', organization: 'org-1', workspace: workspace(), ...overrides })
+  beforeEach(async () => {
+    program(join(dir, 'bin', 'security'), 'echo token-123')
+    ssh(); aliyun()
+    await checkout('app', 'git@codeup.aliyun.com:group/app.git')
+    await checkout('other', 'git@github.com:acme/other.git')
+  })
+
+  it('resolves the account, the keychain token, the SSH key, and the workspace repositories it may push to', async () => {
+    expect(await resolveCodeup(machine(), codeup(), codeupProbe, path)).toEqual(account())
+    // The commit identity may be configured, which wins over the one the account reports.
+    expect(await resolveCodeup(machine(), codeup({ commitEmail: 'yedou@example.org' }), codeupProbe, path)).toMatchObject({ account: { commitEmail: 'yedou@example.org' } })
+    expect(await resolveCodeup(machine(), {}, codeupProbe, path)).toBeUndefined()
+  })
+  it('names what the Codeup account needs and where it is set', async () => {
+    const needs = async (code: string, values: Record<string, unknown>, config: Record<string, unknown>) =>
+      expect(resolveCodeup(machine(), codeup(config), codeupProbe, path)).rejects.toEqual(setupError('codeup', code, values))
+    await needs('codeupCliUnset', {}, { cli: '' })
+    await needs('codeupOrgUnset', {}, { organization: '' })
+    await needs('codeupWorkspaceUnset', {}, { workspace: '' })
+    await needs('codeupCliMissing', { output: `${join(dir, 'missing')} is not an executable file` }, { cli: join(dir, 'missing') })
+    await needs('codeupWorkspaceMissing', { workspace: join(dir, 'nowhere') }, { workspace: join(dir, 'nowhere') })
+    // A locked or absent keychain entry is named as such, not as a signed-out CLI.
+    program(join(dir, 'bin', 'security'), 'exit 44')
+    await needs('codeupTokenMissing', { output: expect.stringContaining('no yunxiao token') }, {})
+    program(join(dir, 'bin', 'security'), 'echo token-123')
+    aliyun({ user: 'echo "StatusCode: 401 Data: {\\"message\\":\\"token expired\\"}" >&2; exit 1' })
+    await needs('codeupCliSignedOut', { output: expect.stringContaining('token expired') }, {})
+    aliyun()
+    ssh(false)
+    await needs('codeupSshUnavailable', { output: expect.stringContaining('Permission denied') }, {})
+    ssh()
+    aliyun({ repository: `echo '{"id":"451f7a12","pathWithNamespace":"group/app","accessLevel":"20"}'` })
+    await needs('codeupNoRepositories', { workspace: join(dir, 'workspace'), refused: 'group/app' }, {})
+    aliyun({ repository: 'echo "not a repository report"' })
+    await needs('codeupRepositoryUnreadable', { repository: 'group/app' }, {})
+  })
+  it('hosts with Codeup when GitHub is not configured, and refuses to start with neither', async () => {
+    const resolved = await resolveHosting(machine(), { github: {}, codeup: codeup() }, codeupProbe, path)
+    expect(resolved).toMatchObject({ repository: '', codeup: account(), hosting: { platform: 'codeup', repositories: ['451f7a12'] } })
+    expect(resolved.github).toBeUndefined()
+    // GitHub wins when it is configured, and the Codeup account stays available to the Codeup Source.
+    const both = await resolveHosting(machine(), { github: { repository: 'acme/widgets', cli: 'gh' }, codeup: codeup() }, codeupProbe, path)
+    expect(both).toMatchObject({ repository: 'acme/widgets', hosting: { platform: 'github' }, codeup: { organization: 'org-1' } })
+    await expect(resolveHosting(machine(), { github: {}, codeup: {} }, codeupProbe, path)).rejects.toEqual(setupError('deployment', 'hostingUnset'))
+  })
+  it('reads the group path of a Codeup remote, and nothing from another host', () => {
+    expect(codeupPath('git@codeup.aliyun.com:group/app.git')).toBe('group/app')
+    expect(codeupPath('https://codeup.aliyun.com/group/app.git')).toBe('group/app')
+    expect(codeupPath('ssh://git@codeup.aliyun.com/group/app/')).toBe('group/app')
+    expect(codeupPath('git@github.com:acme/widgets.git')).toBeUndefined()
+    expect(codeupPath('')).toBeUndefined()
   })
 })

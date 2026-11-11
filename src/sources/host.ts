@@ -54,8 +54,18 @@ export interface SourceContext {
     get(id: string): Ticket | undefined
     /** Open tickets, newest first. */
     open(): Ticket[]
-    /** Binds an open ticket to follow a Source Thread (`own` when opened by the ticket) so the Thread's close, not a ready report, ends the ticket. */
-    bindThread(id: string, thread: ThreadRef, own: boolean): void
+    /** Tickets that ended at or after `since`, newest first; a Source writes its own record back for those it started. */
+    ended(since: string): Ticket[]
+    /**
+     * Ends a Ticket the Source itself started, such as one whose work item was assigned to somebody else; `reason` is recorded
+     * on it. A Source stops only its own Tickets, never one that merely follows a Thread it owns.
+     */
+    stop(id: string, reason?: string): void
+    /**
+     * Binds an open ticket to follow a Source Thread (`own` when opened by the ticket) so the Thread's close, not a ready report,
+     * ends the ticket; `ends` false binds it for its messages only, so a merged change request leaves the ticket to its report.
+     */
+    bindThread(id: string, thread: ThreadRef, own: boolean, ends?: boolean): void
     /** Reports that a followed Thread closed at `at`; each open ticket following it ends once no `own` Thread remains open and no resumed work is still running. */
     threadClosed(thread: ThreadRef, outcome: 'merged' | 'closed', at: string): void
   }

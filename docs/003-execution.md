@@ -71,11 +71,13 @@ The prepare command and Executor instructions receive the same execution variabl
 | `DSH_SUPERAGENT_GITHUB_REPOSITORY` | GitHub | The repository the Source watches, `owner/name` |
 | `DSH_SUPERAGENT_GITHUB_ACCOUNT`, `DSH_SUPERAGENT_GITHUB_COMMIT_EMAIL` | GitHub | The agent account and its commit email |
 | `DSH_SUPERAGENT_GITHUB_NUMBER`, `DSH_SUPERAGENT_GITHUB_PR_HEAD` | GitHub | The Issue or pull request that started the Ticket, and its head ref when it is a pull request |
+| `DSH_SUPERAGENT_WORKSPACE`, `DSH_SUPERAGENT_YUNXIAO_ORG`, `DSH_SUPERAGENT_YUNXIAO_ACCOUNT` | Codeup | The workspace whose repositories a Ticket may deliver to, the yunxiao organization, and the account the agent acts as |
+| `DSH_SUPERAGENT_YUNXIAO_WORKITEM`, `DSH_SUPERAGENT_YUNXIAO_SERIAL`, `DSH_SUPERAGENT_YUNXIAO_URL`, `DSH_SUPERAGENT_YUNXIAO_CATEGORY` | Codeup | The work item that started the Ticket, its serial, address and category; empty while no work-item Source exists |
 | `DSH_SUPERAGENT_FEISHU_BOT`, `DSH_SUPERAGENT_FEISHU_CHAT` | Feishu | The bot, and the chat that started the Ticket |
 
 Ticket-specific values come from its directory and originating Trigger. Other values come from the current deployment settings. Only the panel can change execution environment settings; text sent to the main Session cannot change the configured shell command.
 
-Workers reach GitHub through the agent account's `gh` and Feishu through the bot's `lark-cli`. Blocked commands fail when invoked by name.
+Workers reach GitHub through the agent account's `gh`, Codeup through the `aliyun` forwarding script that reads the yunxiao token from the keychain, and Feishu through the bot's `lark-cli`. Blocked commands fail when invoked by name.
 
 These wrappers and directories establish defaults, not a security boundary. A worker can still execute a program by absolute path.
 
@@ -98,6 +100,8 @@ Reviews without a body, such as approvals, also arrive as Triggers and can wake 
 A Ticket follows the pull request it started from once its Executor reports it. It also follows each pull request opened from its branch once reported by the Executor or found by the GitHub Source. Reopened pull requests are followed again.
 
 The Ticket is done when none of the pull requests it opened remain open. If it opened none, all pull requests it follows must be closed. It then ends with the outcome of the last relevant close and keeps its Subscriptions, allowing a later human comment to resume it.
+
+A change request binds for its messages only: it is followed, and a person's comment there reaches the Ticket, but its merge does not end the Ticket. Such a Ticket ends with its own ready report, as completed, once the work is verified — the merge is one step of the delivery, not its end.
 
 A close does not end the Ticket while resumed, retried or recovered work is unfinished. It also waits if the Executor acknowledged or answered a follow-up it owns but has not since made a non-progress Report or ended a turn after reading that message. A later `ready` Report ends the Ticket once the same pull-request completion rule is satisfied.
 
